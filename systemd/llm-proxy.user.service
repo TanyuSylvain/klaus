@@ -1,0 +1,15 @@
+[Unit]
+Description=LLM Proxy
+After=default.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tanyu/code_repo/llm_proxy
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/tanyu/code_repo/llm_proxy/.venv/bin/python3 /home/tanyu/code_repo/llm_proxy/main.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

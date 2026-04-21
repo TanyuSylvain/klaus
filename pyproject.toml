@@ -1,7 +1,12 @@
 [project]
 name = "llm-proxy"
 version = "0.1.0"
-description = "Add your description here"
+description = "Lightweight LLM reverse proxy with model name rewriting"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "starlette>=0.41",
+    "httpx>=0.28",
+    "uvicorn>=0.32",
+    "pyyaml>=6.0",
+]

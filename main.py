@@ -1,5 +1,5 @@
+import json
 import logging
-import re
 import httpx
 import uvicorn
 import yaml
@@ -49,23 +49,22 @@ async def proxy(request: Request) -> StreamingResponse:
 
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type and raw_body:
-        match = re.search(rb'"model"\s*:\s*"([^"]+)"', raw_body)
-        if match:
-            original_model = match.group(1).decode()
-            rewritten_model = MAPPINGS.get(original_model, original_model)
-            LOGGER.info(
-                "model rewrite check path=%s inbound_model=%r outbound_model=%r",
-                request.url.path,
-                original_model,
-                rewritten_model,
-            )
-            if original_model != rewritten_model:
-                raw_body = re.sub(
-                    rb'("model"\s*:\s*")([^"]+)(")',
-                    lambda m: m.group(1) + rewritten_model.encode() + m.group(3),
-                    raw_body,
-                    count=1,
+        try:
+            data = json.loads(raw_body)
+            if isinstance(data, dict) and "model" in data:
+                original_model = data["model"]
+                rewritten_model = MAPPINGS.get(original_model, original_model)
+                LOGGER.info(
+                    "model rewrite check path=%s inbound_model=%r outbound_model=%r",
+                    request.url.path,
+                    original_model,
+                    rewritten_model,
                 )
+                if original_model != rewritten_model:
+                    data["model"] = rewritten_model
+                    raw_body = json.dumps(data).encode()
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     upstream_headers = {
         k: v for k, v in request.headers.items()

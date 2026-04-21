@@ -1,4 +1,5 @@
 import json
+import logging
 import httpx
 import uvicorn
 import yaml
@@ -16,6 +17,7 @@ cfg: dict = {}
 UPSTREAM_URL: str = ""
 MAPPINGS: dict[str, str] = {}
 HTTP_CLIENT: httpx.AsyncClient
+LOGGER = logging.getLogger("llm_proxy")
 
 
 async def proxy(request: Request) -> StreamingResponse:
@@ -26,7 +28,15 @@ async def proxy(request: Request) -> StreamingResponse:
         try:
             data = json.loads(raw_body)
             if isinstance(data, dict) and "model" in data:
-                data["model"] = MAPPINGS.get(data["model"], data["model"])
+                original_model = data["model"]
+                rewritten_model = MAPPINGS.get(original_model, original_model)
+                LOGGER.info(
+                    "model rewrite check path=%s inbound_model=%r outbound_model=%r",
+                    request.url.path,
+                    original_model,
+                    rewritten_model,
+                )
+                data["model"] = rewritten_model
                 raw_body = json.dumps(data).encode()
         except (json.JSONDecodeError, ValueError):
             pass
@@ -79,6 +89,11 @@ app = Starlette(routes=[
 
 def main():
     global cfg, UPSTREAM_URL, MAPPINGS, HTTP_CLIENT
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)

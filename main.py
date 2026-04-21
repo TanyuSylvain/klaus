@@ -5,6 +5,7 @@ import uvicorn
 import yaml
 from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.responses import JSONResponse
 from starlette.responses import StreamingResponse
 from starlette.routing import Route
 
@@ -18,6 +19,25 @@ UPSTREAM_URL: str = ""
 MAPPINGS: dict[str, str] = {}
 HTTP_CLIENT: httpx.AsyncClient
 LOGGER = logging.getLogger("llm_proxy")
+
+
+def models_payload() -> dict:
+    return {
+        "data": [
+            {
+                "id": model_name,
+                "type": "model",
+                "display_name": model_name,
+                "created_at": "2025-01-01T00:00:00Z",
+            }
+            for model_name in MAPPINGS
+        ],
+        "has_more": False,
+    }
+
+
+async def list_models(_: Request) -> JSONResponse:
+    return JSONResponse(models_payload())
 
 
 async def proxy(request: Request) -> StreamingResponse:
@@ -83,6 +103,8 @@ async def proxy(request: Request) -> StreamingResponse:
 
 
 app = Starlette(routes=[
+    Route("/models", list_models, methods=["GET"]),
+    Route("/v1/models", list_models, methods=["GET"]),
     Route("/{path:path}", proxy, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"]),
 ])
 

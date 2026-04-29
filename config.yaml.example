@@ -1,0 +1,13 @@
+# Upstream LLM provider base URL (required, no trailing slash)
+upstream_url: "https://open.bigmodel.cn/api/anthropic"
+
+# Local address and port the proxy listens on (optional)
+listen_host: "0.0.0.0"
+listen_port: 8080
+
+# Model name mappings: what the client sends (key) -> what the provider expects (value)
+# Models not listed here pass through unchanged.
+model_mappings:
+  claude-haiku-4-5: "glm-4.5-air"
+  claude-sonnet-4-6: "glm-5"
+  claude-opus-4-7: "glm-5.1"

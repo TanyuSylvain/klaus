@@ -16,6 +16,9 @@ HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "transfer-encoding", "te", "trailers",
     "upgrade", "proxy-authorization", "proxy-authenticate", "content-length",
 })
+REWRITTEN_ENTITY_HEADERS = frozenset({
+    "content-encoding", "content-length", "content-md5", "digest", "etag",
+})
 
 cfg: dict = {}
 UPSTREAM_URL: str = ""
@@ -75,8 +78,147 @@ async def list_models(_: Request) -> JSONResponse:
     return JSONResponse(models_payload())
 
 
+def _is_anthropic_messages_path(path: str) -> bool:
+    return path == "/v1/messages"
+
+
+def _should_rewrite_anthropic_response(
+    request_path: str,
+    original_model: str | None,
+    rewritten_model: str | None,
+) -> bool:
+    return (
+        _is_anthropic_messages_path(request_path)
+        and original_model is not None
+        and original_model != rewritten_model
+    )
+
+
+def _sanitize_rewritten_headers(headers: dict[str, str]) -> dict[str, str]:
+    return {
+        k: v for k, v in headers.items()
+        if k.lower() not in REWRITTEN_ENTITY_HEADERS
+    }
+
+
+def _rewrite_anthropic_json_body(body: bytes, original_model: str) -> bytes:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+
+    if isinstance(payload, dict) and "model" in payload:
+        payload["model"] = original_model
+        return json.dumps(payload).encode("utf-8")
+
+    return body
+
+
+def _take_complete_line(buf: str) -> tuple[str, str] | None:
+    for idx, ch in enumerate(buf):
+        if ch == "\n":
+            if idx > 0 and buf[idx - 1] == "\r":
+                return buf[:idx - 1], buf[idx + 1:]
+            return buf[:idx], buf[idx + 1:]
+        if ch == "\r":
+            if idx + 1 < len(buf) and buf[idx + 1] == "\n":
+                return buf[:idx], buf[idx + 2:]
+            return buf[:idx], buf[idx + 1:]
+    return None
+
+
+def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) -> str:
+    data_values: list[str] = []
+    first_data_index: int | None = None
+
+    for idx, line in enumerate(event_lines):
+        if not line.startswith("data:"):
+            continue
+        if first_data_index is None:
+            first_data_index = idx
+        value = line[5:]
+        if value.startswith(" "):
+            value = value[1:]
+        data_values.append(value)
+
+    if first_data_index is None:
+        return "\n".join(event_lines) + "\n\n"
+
+    payload_text = "\n".join(data_values).strip()
+    if not payload_text or payload_text == "[DONE]":
+        return "\n".join(event_lines) + "\n\n"
+
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return "\n".join(event_lines) + "\n\n"
+
+    if (
+        isinstance(payload, dict)
+        and payload.get("type") == "message_start"
+        and isinstance(payload.get("message"), dict)
+        and "model" in payload["message"]
+    ):
+        payload["message"]["model"] = original_model
+    else:
+        return "\n".join(event_lines) + "\n\n"
+
+    rebuilt: list[str] = []
+    emitted_data = False
+    for idx, line in enumerate(event_lines):
+        if idx == first_data_index:
+            rebuilt.append("data: " + json.dumps(payload))
+            emitted_data = True
+            continue
+        if line.startswith("data:"):
+            continue
+        rebuilt.append(line)
+    if not emitted_data:
+        rebuilt.append("data: " + json.dumps(payload))
+    return "\n".join(rebuilt) + "\n\n"
+
+
+async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
+    line_buf = ""
+    event_lines: list[str] = []
+
+    async for chunk in upstream_response.aiter_text():
+        line_buf += chunk
+        while True:
+            parsed = _take_complete_line(line_buf)
+            if parsed is None:
+                break
+            line, line_buf = parsed
+            if line == "":
+                if event_lines:
+                    yield _rewrite_anthropic_sse_event(event_lines, original_model).encode("utf-8")
+                    event_lines.clear()
+                else:
+                    yield b"\n"
+                continue
+            event_lines.append(line)
+
+    if line_buf:
+        event_lines.append(line_buf)
+    if event_lines:
+        yield _rewrite_anthropic_sse_event(event_lines, original_model).encode("utf-8")
+
+
+async def _rewrite_anthropic_response(upstream_response, original_model: str):
+    content_type = upstream_response.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        async for chunk in _rewrite_anthropic_sse_stream(upstream_response, original_model):
+            yield chunk
+        return
+
+    body = await upstream_response.aread()
+    yield _rewrite_anthropic_json_body(body, original_model)
+
+
 async def proxy(request: Request) -> StreamingResponse:
     raw_body = await request.body()
+    original_model: str | None = None
+    rewritten_model: str | None = None
 
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type and raw_body:
@@ -102,6 +244,8 @@ async def proxy(request: Request) -> StreamingResponse:
         if k.lower() not in HOP_BY_HOP
     }
     upstream_headers["host"] = httpx.URL(UPSTREAM_URL).host
+    if _should_rewrite_anthropic_response(request.url.path, original_model, rewritten_model):
+        upstream_headers["accept-encoding"] = "identity"
 
     target = UPSTREAM_URL + request.url.path
     if request.url.query:
@@ -123,12 +267,29 @@ async def proxy(request: Request) -> StreamingResponse:
         if k.lower() not in HOP_BY_HOP
     }
 
-    async def generate():
-        try:
-            async for chunk in upstream_response.aiter_raw():
-                yield chunk
-        finally:
-            await upstream_response.aclose()
+    if _should_rewrite_anthropic_response(request.url.path, original_model, rewritten_model):
+        resp_headers = _sanitize_rewritten_headers(resp_headers)
+
+        async def generate():
+            try:
+                async for chunk in _rewrite_anthropic_response(upstream_response, original_model):
+                    yield chunk
+            finally:
+                await upstream_response.aclose()
+    elif original_model is not None and original_model != rewritten_model:
+        async def generate():
+            try:
+                async for chunk in upstream_response.aiter_raw():
+                    yield chunk
+            finally:
+                await upstream_response.aclose()
+    else:
+        async def generate():
+            try:
+                async for chunk in upstream_response.aiter_raw():
+                    yield chunk
+            finally:
+                await upstream_response.aclose()
 
     return StreamingResponse(
         content=generate(),

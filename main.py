@@ -1,5 +1,8 @@
 import json
 import logging
+import sqlite3
+import time
+from datetime import datetime
 
 import httpx
 import uvicorn
@@ -30,6 +33,27 @@ IMAGE_API_KEY: str = ""
 IMAGE_ENABLED: bool = False
 IMAGE_ALLOWED_MODELS: set[str] = set()
 IMAGE_CLIENT: httpx.AsyncClient | None = None
+
+IMAGE_DB_PATH: str = "image_usage.db"
+
+
+def init_image_db():
+    with sqlite3.connect(IMAGE_DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS image_requests "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            " api_key TEXT NOT NULL, "
+            " timestamp TEXT NOT NULL, "
+            " elapsed_ms REAL NOT NULL)"
+        )
+
+
+def log_image_request(api_key: str, elapsed_ms: float):
+    with sqlite3.connect(IMAGE_DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO image_requests (api_key, timestamp, elapsed_ms) VALUES (?, ?, ?)",
+            (api_key, datetime.now().isoformat(), elapsed_ms),
+        )
 
 
 def models_payload() -> dict:
@@ -165,6 +189,17 @@ async def mcp_proxy(request: Request) -> StreamingResponse:
 
 
 async def image_proxy(request: Request) -> StreamingResponse:
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        caller_key = auth[7:]
+    else:
+        caller_key = ""
+    if not caller_key:
+        return JSONResponse(
+            {"error": {"message": "Missing Authorization header"}},
+            status_code=401,
+        )
+
     raw_body = await request.body()
 
     model = ""
@@ -201,6 +236,7 @@ async def image_proxy(request: Request) -> StreamingResponse:
 
     LOGGER.info("image proxy path=%s model=%s target=%s", request.url.path, model, target)
 
+    t0 = time.monotonic()
     req = httpx.Request(
         method=request.method,
         url=target,
@@ -211,6 +247,10 @@ async def image_proxy(request: Request) -> StreamingResponse:
         upstream_response = await IMAGE_CLIENT.send(req, stream=True)
     except httpx.RemoteProtocolError:
         upstream_response = await IMAGE_CLIENT.send(req, stream=True)
+    elapsed_ms = (time.monotonic() - t0) * 1000
+
+    if upstream_response.status_code < 400:
+        log_image_request(caller_key, elapsed_ms)
 
     resp_headers = {
         k: v for k, v in upstream_response.headers.multi_items()
@@ -307,6 +347,7 @@ def main():
         IMAGE_API_KEY = image_cfg["api_key"]
         IMAGE_ALLOWED_MODELS = set(image_cfg.get("allowed_models", []))
         IMAGE_ENABLED = True
+        init_image_db()
         LOGGER.info("Image proxy enabled, upstream=%s, models=%s", IMAGE_UPSTREAM_URL, IMAGE_ALLOWED_MODELS)
     else:
         LOGGER.info("Image proxy disabled (no image config section)")

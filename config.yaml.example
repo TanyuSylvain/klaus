@@ -18,3 +18,20 @@ model_mappings:
 # mcp:
 #   upstream_url: "https://open.bigmodel.cn/api/paas/v4"
 #   api_key: "your-zhipu-api-key-here"
+
+# CCH public status page wrapper.
+# When enabled, llm-proxy serves:
+#   GET /cch/status
+#   GET /cch/status/weekly-consumption
+# The weekly number is aggregated from CCH provider limit usage for providers
+# whose provider groups include provider_group.
+# cch_status:
+#   enabled: false
+#   base_url: "http://your-cch-host:22803"
+#   admin_token: "your-cch-auth-token"
+#   locale: "zh-CN"
+#   status_group_slug: "opus"
+#   provider_group: "claude"
+#   timezone: "Asia/Shanghai"
+#   weekly_quota_usd: 500
+#   cache_ttl_seconds: 300

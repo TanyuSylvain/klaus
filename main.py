@@ -12,6 +12,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
 
+from cch_status import CchStatusConfig, CchStatusFeature
+
 HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "transfer-encoding", "te", "trailers",
     "upgrade", "proxy-authorization", "proxy-authenticate", "content-length",
@@ -432,11 +434,13 @@ async def image_proxy(request: Request) -> StreamingResponse:
     )
 
 
-def build_routes() -> list:
+def build_routes(cch_status_feature: CchStatusFeature | None = None) -> list:
     routes = [
         Route("/models", list_models, methods=["GET"]),
         Route("/v1/models", list_models, methods=["GET"]),
     ]
+    if cch_status_feature is not None:
+        routes.extend(cch_status_feature.routes())
     if MCP_ENABLED:
         routes.append(
             Mount("/mcp", routes=[
@@ -452,30 +456,37 @@ def build_routes() -> list:
     return routes
 
 
-async def lifespan(_app: Starlette):
-    global MODEL_CLIENT, MCP_CLIENT, IMAGE_CLIENT
+def make_lifespan(cch_status_feature: CchStatusFeature | None = None):
+    async def lifespan(_app: Starlette):
+        global MODEL_CLIENT, MCP_CLIENT, IMAGE_CLIENT
 
-    client_kwargs = dict(
-        http2=True,
-        follow_redirects=False,
-        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
-        timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=5.0),
-    )
-    MODEL_CLIENT = httpx.AsyncClient(**client_kwargs)
-    if MCP_ENABLED:
-        MCP_CLIENT = httpx.AsyncClient(**client_kwargs)
-    if IMAGE_ENABLED:
-        IMAGE_CLIENT = httpx.AsyncClient(**client_kwargs)
+        client_kwargs = dict(
+            http2=True,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=5.0),
+        )
+        MODEL_CLIENT = httpx.AsyncClient(**client_kwargs)
+        if MCP_ENABLED:
+            MCP_CLIENT = httpx.AsyncClient(**client_kwargs)
+        if IMAGE_ENABLED:
+            IMAGE_CLIENT = httpx.AsyncClient(**client_kwargs)
+        if cch_status_feature is not None:
+            await cch_status_feature.start(client_kwargs)
 
-    try:
-        yield
-    finally:
-        if MODEL_CLIENT is not None:
-            await MODEL_CLIENT.aclose()
-        if MCP_CLIENT is not None:
-            await MCP_CLIENT.aclose()
-        if IMAGE_CLIENT is not None:
-            await IMAGE_CLIENT.aclose()
+        try:
+            yield
+        finally:
+            if MODEL_CLIENT is not None:
+                await MODEL_CLIENT.aclose()
+            if MCP_CLIENT is not None:
+                await MCP_CLIENT.aclose()
+            if IMAGE_CLIENT is not None:
+                await IMAGE_CLIENT.aclose()
+            if cch_status_feature is not None:
+                await cch_status_feature.aclose()
+
+    return lifespan
 
 
 def main():
@@ -513,7 +524,21 @@ def main():
     else:
         LOGGER.info("Image proxy disabled (no image config section)")
 
-    app = Starlette(routes=build_routes(), lifespan=lifespan)
+    cch_status_config = CchStatusConfig.from_dict(cfg.get("cch_status"))
+    cch_status_feature = CchStatusFeature(cch_status_config) if cch_status_config is not None else None
+    if cch_status_feature is not None:
+        LOGGER.info(
+            "CCH status enabled, upstream=%s, group=%s",
+            cch_status_config.base_url,
+            cch_status_config.status_group_slug,
+        )
+    else:
+        LOGGER.info("CCH status disabled (no enabled cch_status config section)")
+
+    app = Starlette(
+        routes=build_routes(cch_status_feature),
+        lifespan=make_lifespan(cch_status_feature),
+    )
 
     uvicorn.run(
         app,

@@ -27,6 +27,8 @@ class CchStatusConfig:
     timezone: str = "Asia/Shanghai"
     weekly_quota_usd: Decimal | None = None
     cache_ttl_seconds: int = 300
+    auto_manage_provider_group_quota: bool = False
+    auto_disable_threshold_pct: Decimal = Decimal("100")
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "CchStatusConfig | None":
@@ -40,6 +42,7 @@ class CchStatusConfig:
 
         quota_raw = raw.get("weekly_quota_usd")
         weekly_quota_usd = Decimal(str(quota_raw)) if quota_raw is not None else None
+        threshold_raw = raw.get("auto_disable_threshold_pct", 100)
 
         return cls(
             base_url=base_url,
@@ -50,6 +53,10 @@ class CchStatusConfig:
             timezone=str(raw.get("timezone", "Asia/Shanghai")),
             weekly_quota_usd=weekly_quota_usd,
             cache_ttl_seconds=int(raw.get("cache_ttl_seconds", 300)),
+            auto_manage_provider_group_quota=bool(
+                raw.get("auto_manage_provider_group_quota", False)
+            ),
+            auto_disable_threshold_pct=Decimal(str(threshold_raw)),
         )
 
 
@@ -59,6 +66,7 @@ class CchStatusFeature:
         self.client: httpx.AsyncClient | None = None
         self._cache: dict[str, Any] | None = None
         self._cache_expires_at = 0.0
+        self._auto_disabled_provider_ids: set[int] = set()
 
     def routes(self) -> list[Route]:
         return [
@@ -117,6 +125,7 @@ class CchStatusFeature:
         quota = self.config.weekly_quota_usd
         remaining = quota - used if quota is not None else None
         usage_pct = (used / quota * Decimal("100")) if quota and quota > 0 else None
+        auto_manage = await self._manage_provider_group_quota(providers, usage_pct)
 
         payload = {
             "weekStart": week_start.isoformat(),
@@ -129,6 +138,7 @@ class CchStatusFeature:
             "usagePct": _percent_float(usage_pct),
             "providerIds": provider_ids,
             "source": "providerLimitUsage",
+            "autoManageProviderGroupQuota": auto_manage,
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }
 
@@ -178,6 +188,87 @@ class CchStatusFeature:
             raise RuntimeError(f"CCH costWeekly.current is not numeric: {current!r}") from exc
 
         return used
+
+    async def _manage_provider_group_quota(
+        self,
+        providers: list[dict[str, Any]],
+        usage_pct: Decimal | None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "enabled": self.config.auto_manage_provider_group_quota,
+            "thresholdPct": _percent_float(self.config.auto_disable_threshold_pct),
+            "triggered": False,
+            "disabledProviderIds": [],
+            "restoredProviderIds": [],
+            "failedProviderIds": [],
+            "pendingRestoreProviderIds": sorted(self._auto_disabled_provider_ids),
+        }
+
+        if not self.config.auto_manage_provider_group_quota:
+            return result
+
+        if self.config.weekly_quota_usd is None or self.config.weekly_quota_usd <= 0:
+            result["reason"] = "missing_or_invalid_quota"
+            return result
+
+        if usage_pct is None:
+            result["reason"] = "usage_pct_unavailable"
+            return result
+
+        provider_by_id = {
+            int(provider["id"]): provider
+            for provider in providers
+            if provider.get("id") is not None
+        }
+
+        # Forget stale providers and providers an admin has already re-enabled.
+        for provider_id in list(self._auto_disabled_provider_ids):
+            provider = provider_by_id.get(provider_id)
+            if provider is None or _provider_enabled(provider):
+                self._auto_disabled_provider_ids.discard(provider_id)
+
+        threshold = self.config.auto_disable_threshold_pct
+        if usage_pct >= threshold:
+            result["triggered"] = True
+            for provider_id, provider in provider_by_id.items():
+                if not _provider_enabled(provider):
+                    continue
+                if await self._set_provider_enabled(provider_id, False):
+                    self._auto_disabled_provider_ids.add(provider_id)
+                    result["disabledProviderIds"].append(provider_id)
+                else:
+                    result["failedProviderIds"].append(provider_id)
+        else:
+            for provider_id in list(self._auto_disabled_provider_ids):
+                provider = provider_by_id.get(provider_id)
+                if provider is None:
+                    self._auto_disabled_provider_ids.discard(provider_id)
+                    continue
+                if _provider_enabled(provider):
+                    self._auto_disabled_provider_ids.discard(provider_id)
+                    continue
+                if await self._set_provider_enabled(provider_id, True):
+                    self._auto_disabled_provider_ids.discard(provider_id)
+                    result["restoredProviderIds"].append(provider_id)
+                else:
+                    result["failedProviderIds"].append(provider_id)
+
+        result["pendingRestoreProviderIds"] = sorted(self._auto_disabled_provider_ids)
+        return result
+
+    async def _set_provider_enabled(self, provider_id: int, enabled: bool) -> bool:
+        try:
+            await self._post_action(
+                "/api/actions/providers/editProvider",
+                {"providerId": provider_id, "is_enabled": enabled},
+            )
+        except Exception:
+            LOGGER.exception(
+                "failed to set CCH provider enabled state",
+                extra={"provider_id": provider_id, "enabled": enabled},
+            )
+            return False
+        return True
 
     async def _post_action(self, path: str, payload: dict[str, Any]) -> Any:
         client = self._require_client()
@@ -310,6 +401,14 @@ def _provider_groups(provider: dict[str, Any]) -> list[str]:
             groups.extend(str(key).strip() for key in priorities if str(key).strip())
 
     return sorted(set(groups))
+
+
+def _provider_enabled(provider: dict[str, Any]) -> bool:
+    for field in ("isEnabled", "is_enabled"):
+        value = provider.get(field)
+        if isinstance(value, bool):
+            return value
+    return False
 
 
 def _parse_provider_groups(value: Any) -> list[str]:

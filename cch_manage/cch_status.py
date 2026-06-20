@@ -28,6 +28,7 @@ class CchStatusConfig:
     weekly_quota_usd: Decimal | None = None
     cache_ttl_seconds: int = 300
     weekly_leaderboard_enabled: bool = False
+    status_group_provider_groups: dict[str, list[str]] | None = None
     auto_manage_provider_group_quota: bool = False
     auto_disable_threshold_pct: Decimal = Decimal("100")
 
@@ -44,6 +45,9 @@ class CchStatusConfig:
         quota_raw = raw.get("weekly_quota_usd")
         weekly_quota_usd = Decimal(str(quota_raw)) if quota_raw is not None else None
         threshold_raw = raw.get("auto_disable_threshold_pct", 100)
+        status_group_provider_groups = _parse_status_group_provider_groups(
+            raw.get("status_group_provider_groups")
+        )
 
         return cls(
             base_url=base_url,
@@ -55,6 +59,7 @@ class CchStatusConfig:
             weekly_quota_usd=weekly_quota_usd,
             cache_ttl_seconds=int(raw.get("cache_ttl_seconds", 300)),
             weekly_leaderboard_enabled=bool(raw.get("weekly_leaderboard_enabled", False)),
+            status_group_provider_groups=status_group_provider_groups,
             auto_manage_provider_group_quota=bool(
                 raw.get("auto_manage_provider_group_quota", False)
             ),
@@ -70,6 +75,8 @@ class CchStatusFeature:
         self._cache_expires_at = 0.0
         self._leaderboard_cache: dict[str, Any] | None = None
         self._leaderboard_cache_expires_at = 0.0
+        self._price_coefficients_cache: dict[str, Any] | None = None
+        self._price_coefficients_cache_expires_at = 0.0
         self._auto_disabled_provider_ids: set[int] = set()
 
     def routes(self) -> list[Route]:
@@ -77,6 +84,7 @@ class CchStatusFeature:
             Route("/cch/status", self.status_page, methods=["GET"]),
             Route("/cch/status/weekly-consumption", self.weekly_consumption, methods=["GET"]),
             Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
+            Route("/cch/status/group-price-coefficients", self.group_price_coefficients, methods=["GET"]),
         ]
 
     async def start(self, client_kwargs: dict[str, Any]) -> None:
@@ -102,6 +110,17 @@ class CchStatusFeature:
             payload = await self.get_weekly_leaderboard()
         except Exception as exc:
             LOGGER.exception("failed to build CCH weekly leaderboard")
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"ok": True, "data": payload})
+
+    async def group_price_coefficients(self, _: Request) -> JSONResponse:
+        try:
+            payload = await self.get_group_price_coefficients()
+        except Exception as exc:
+            LOGGER.exception("failed to build CCH group price coefficients")
             return JSONResponse(
                 {"ok": False, "error": str(exc)},
                 status_code=502,
@@ -188,6 +207,42 @@ class CchStatusFeature:
             now_monotonic + max(1, self.config.cache_ttl_seconds)
         )
         return payload
+
+    async def get_group_price_coefficients(self) -> dict[str, Any]:
+        now_monotonic = time.monotonic()
+        if (
+            self._price_coefficients_cache is not None
+            and now_monotonic < self._price_coefficients_cache_expires_at
+        ):
+            return self._price_coefficients_cache
+
+        providers, _ = await self._get_claude_group_providers()
+        public_status = await self._get_public_status_groups()
+        groups = _extract_group_price_coefficients(
+            providers,
+            public_status,
+            self.config.status_group_provider_groups,
+        )
+        payload = {
+            "groups": groups,
+            "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
+        }
+        self._price_coefficients_cache = payload
+        self._price_coefficients_cache_expires_at = (
+            now_monotonic + max(1, self.config.cache_ttl_seconds)
+        )
+        return payload
+
+    async def _get_public_status_groups(self) -> list[dict[str, Any]]:
+        client = self._require_client()
+        response = await client.get(
+            f"{self.config.base_url}/api/public-status",
+            params={"include": "groups"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        groups = data.get("groups") if isinstance(data, dict) else None
+        return [group for group in groups if isinstance(group, dict)] if isinstance(groups, list) else []
 
     def _current_week_range(self) -> tuple[datetime, datetime]:
         tz = ZoneInfo(self.config.timezone)
@@ -356,6 +411,7 @@ class CchStatusFeature:
   const refreshMs = {max(1, self.config.cache_ttl_seconds) * 1000};
   const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
   const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
+  const priceCoefficientsEndpoint = window.location.origin + "/cch/status/group-price-coefficients";
   const money = (value) => typeof value === "number"
     ? "$" + value.toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})
     : "—";
@@ -423,6 +479,10 @@ class CchStatusFeature:
   const scheduleRenderLeaderboard = (data, attempts = 20) => {{
     if (renderLeaderboard(data) || attempts <= 0) return;
     window.setTimeout(() => scheduleRenderLeaderboard(data, attempts - 1), 250);
+  }};
+  const scheduleRenderPriceCoefficients = (data, attempts = 20) => {{
+    if (renderPriceCoefficients(data) || attempts <= 0) return;
+    window.setTimeout(() => scheduleRenderPriceCoefficients(data, attempts - 1), 250);
   }};
   const trophyStyle = (rank) => {{
     if (rank === 1) return "filter:none;background:rgb(250 204 21 / .16);border-color:rgb(250 204 21 / .55);";
@@ -497,6 +557,42 @@ class CchStatusFeature:
     ].join("");
     return true;
   }};
+  const groupSlugFromHref = (href) => {{
+    const match = String(href || "").match(/\\/status\\/([^/?#]+)(?:[?#].*)?$/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }};
+  const coefficientBadgeStyle = () =>
+    "border:1px solid rgb(16 185 129 / .55);border-radius:6px;background:rgb(16 185 129 / .12);padding:2px 8px;font-size:12px;line-height:1.25;color:rgb(5 150 105);";
+  const renderPriceCoefficients = (data) => {{
+    const groups = data && data.groups && typeof data.groups === "object" ? data.groups : null;
+    if (!groups) return true;
+
+    let renderedAny = false;
+    const links = Array.from(document.querySelectorAll('a[href*="/status/"]'));
+    for (const link of links) {{
+      const slug = groupSlugFromHref(link.getAttribute("href"));
+      if (!slug || !Array.isArray(groups[slug]) || groups[slug].length === 0) continue;
+      if (!String(link.textContent || "").trim()) continue;
+
+      const header = link.closest("div.flex.items-center.gap-2") || link.parentElement;
+      if (!header) continue;
+      link.style.flex = "0 1 auto";
+
+      let badges = header.querySelector(`span[data-cch-price-coefficients="${{slug}}"]`);
+      if (!badges) {{
+        badges = document.createElement("span");
+        badges.dataset.cchPriceCoefficients = slug;
+        badges.style.cssText = "display:inline-flex;flex:0 0 auto;align-items:center;gap:4px;margin-left:6px;";
+        link.insertAdjacentElement("afterend", badges);
+      }}
+
+      badges.innerHTML = groups[slug].map((value) =>
+        `<span style="${{coefficientBadgeStyle()}}">${{escapeHtml(value)}}x</span>`
+      ).join("");
+      renderedAny = true;
+    }}
+    return renderedAny || document.querySelector('a[href*="/status/"]') !== null;
+  }};
   const loadConsumption = () => {{
     fetch(consumptionEndpoint, {{ cache: "no-store" }})
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("weekly consumption unavailable")))
@@ -509,10 +605,18 @@ class CchStatusFeature:
       .then((body) => body && body.ok && scheduleRenderLeaderboard(body.data))
       .catch(() => {{}});
   }};
+  const loadPriceCoefficients = () => {{
+    fetch(priceCoefficientsEndpoint, {{ cache: "no-store" }})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("group price coefficients unavailable")))
+      .then((body) => body && body.ok && scheduleRenderPriceCoefficients(body.data))
+      .catch(() => {{}});
+  }};
   loadConsumption();
   loadLeaderboard();
+  loadPriceCoefficients();
   window.setInterval(loadConsumption, refreshMs);
   window.setInterval(loadLeaderboard, refreshMs);
+  window.setInterval(loadPriceCoefficients, refreshMs);
 }})();
 </script>
 """
@@ -575,6 +679,96 @@ def _parse_provider_groups(value: Any) -> list[str]:
     if not isinstance(value, str):
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _parse_status_group_provider_groups(value: Any) -> dict[str, list[str]] | None:
+    if not isinstance(value, dict):
+        return None
+
+    parsed: dict[str, list[str]] = {}
+    for raw_slug, raw_groups in value.items():
+        slug = str(raw_slug).strip()
+        if not slug:
+            continue
+
+        groups = _parse_provider_groups(raw_groups)
+        if not groups and raw_groups is not None and not isinstance(raw_groups, list):
+            group = str(raw_groups).strip()
+            groups = [group] if group else []
+        if groups:
+            parsed[slug] = groups
+
+    return parsed or None
+
+
+def _extract_group_price_coefficients(
+    providers: list[dict[str, Any]],
+    public_groups: list[dict[str, Any]] | None = None,
+    status_group_provider_groups: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
+    if public_groups:
+        return _extract_public_group_price_coefficients(
+            providers,
+            public_groups,
+            status_group_provider_groups or {},
+        )
+
+    coefficients_by_group: dict[str, set[Decimal]] = {}
+
+    for provider in providers:
+        if not _provider_enabled(provider):
+            continue
+
+        multiplier = _decimal_from_any(provider.get("costMultiplier"))
+        if multiplier <= 0:
+            continue
+
+        for group in _provider_groups(provider):
+            coefficients_by_group.setdefault(group, set()).add(multiplier)
+
+    return {
+        group: [_coefficient_label(value) for value in sorted(coefficients)]
+        for group, coefficients in sorted(coefficients_by_group.items())
+        if coefficients
+    }
+
+
+def _extract_public_group_price_coefficients(
+    providers: list[dict[str, Any]],
+    public_groups: list[dict[str, Any]],
+    status_group_provider_groups: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    enabled_providers = [provider for provider in providers if _provider_enabled(provider)]
+    coefficients_by_slug: dict[str, set[Decimal]] = {}
+
+    for public_group in public_groups:
+        slug = public_group.get("publicGroupSlug")
+        if not isinstance(slug, str) or not slug:
+            continue
+        provider_groups = set(status_group_provider_groups.get(slug) or [slug])
+        group_coefficients: set[Decimal] = set()
+
+        for provider in enabled_providers:
+            if not provider_groups.intersection(_provider_groups(provider)):
+                continue
+            multiplier = _decimal_from_any(provider.get("costMultiplier"))
+            if multiplier > 0:
+                group_coefficients.add(multiplier)
+
+        if group_coefficients:
+            coefficients_by_slug[slug] = group_coefficients
+
+    return {
+        slug: [_coefficient_label(value) for value in sorted(coefficients)]
+        for slug, coefficients in sorted(coefficients_by_slug.items())
+    }
+
+
+def _coefficient_label(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return str(normalized.quantize(Decimal("1")))
+    return format(normalized, "f")
 
 
 def _extract_weekly_leaderboard(

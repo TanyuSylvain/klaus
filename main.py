@@ -473,6 +473,7 @@ def make_lifespan(cch_status_feature: CchStatusFeature | None = None):
             IMAGE_CLIENT = httpx.AsyncClient(**client_kwargs)
         if cch_status_feature is not None:
             await cch_status_feature.start(client_kwargs)
+            await cch_status_feature.warmup()
 
         try:
             yield

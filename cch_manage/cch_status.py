@@ -92,6 +92,26 @@ class CchStatusFeature:
     async def start(self, client_kwargs: dict[str, Any]) -> None:
         self.client = httpx.AsyncClient(**client_kwargs)
 
+    async def warmup(self) -> None:
+        if not self.config.weekly_leaderboard_enabled:
+            LOGGER.info("skipping CCH weekly user usage cache warm-up; leaderboard is disabled")
+            return
+
+        started_at = time.monotonic()
+        try:
+            payload = await self.get_weekly_leaderboard()
+        except Exception:
+            LOGGER.exception("failed to warm CCH weekly user usage cache")
+            return
+
+        user_usage = payload.get("userUsage")
+        user_count = len(user_usage) if isinstance(user_usage, list) else 0
+        LOGGER.info(
+            "warmed CCH weekly user usage cache users=%s elapsed_ms=%.1f",
+            user_count,
+            (time.monotonic() - started_at) * 1000,
+        )
+
     async def aclose(self) -> None:
         if self.client is not None:
             await self.client.aclose()
@@ -250,8 +270,10 @@ class CchStatusFeature:
         if self._leaderboard_cache is None:
             return None
 
+        user_usage = self._leaderboard_cache.get("userUsage", [])
+        total_user = len(user_usage) if isinstance(user_usage, list) else 0
         target_hash = _api_key_hash(api_key)
-        for entry in self._leaderboard_cache.get("userUsage", []):
+        for entry in user_usage:
             if not isinstance(entry, dict):
                 continue
             key_hashes = entry.get("apiKeyHashes")
@@ -268,6 +290,7 @@ class CchStatusFeature:
                 "usedUsd": entry.get("usedUsd"),
                 "requestCount": entry.get("requestCount"),
                 "rank": entry.get("rank"),
+                "totalUser": total_user,
                 "generatedAt": self._leaderboard_cache.get("generatedAt"),
                 "cacheExpiresInSeconds": max(0, round(cache_expires_at - now_monotonic, 3)),
                 "stale": now_monotonic >= cache_expires_at,

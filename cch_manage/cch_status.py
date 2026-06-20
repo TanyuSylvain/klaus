@@ -2,12 +2,14 @@ import json
 import logging
 import re
 import time
+from asyncio import Lock
 from dataclasses import dataclass
 from datetime import UTC, datetime, time as datetime_time, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from html import escape
 from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -18,6 +20,15 @@ from starlette.routing import Route
 
 LOGGER = logging.getLogger("llm_proxy.cch_status")
 ROOT_RELATIVE_ATTR_RE = re.compile(r'(?P<prefix>\b(?:href|src|action)=["\'])(?P<url>/[^"\']*)')
+
+
+@dataclass(frozen=True)
+class _PublicStatusCacheEntry:
+    payload: dict[str, Any]
+    status_code: int
+    expires_at: float
+
+
 @dataclass(frozen=True)
 class CchStatusConfig:
     base_url: str
@@ -78,10 +89,14 @@ class CchStatusFeature:
         self._leaderboard_cache_expires_at = 0.0
         self._price_coefficients_cache: dict[str, Any] | None = None
         self._price_coefficients_cache_expires_at = 0.0
+        self._public_status_cache: dict[str, _PublicStatusCacheEntry] = {}
+        self._public_status_lock = Lock()
         self._auto_disabled_provider_ids: set[int] = set()
 
     def routes(self) -> list[Route]:
         return [
+            Route("/api/public-status", self.public_status, methods=["GET"]),
+            Route("/api/public-site-meta", self.public_site_meta, methods=["GET"]),
             Route("/cch/status", self.status_page, methods=["GET"]),
             Route("/cch/status/weekly-consumption", self.weekly_consumption, methods=["GET"]),
             Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
@@ -174,6 +189,44 @@ class CchStatusFeature:
             )
         return JSONResponse({"ok": True, "data": payload})
 
+    async def public_status(self, request: Request) -> JSONResponse:
+        try:
+            payload, status_code = await self._get_cached_public_status(request.url.query)
+        except Exception as exc:
+            LOGGER.exception("failed to proxy CCH public status")
+            return JSONResponse(
+                {"error": "CCH public status unavailable", "detail": str(exc)},
+                status_code=502,
+                headers={
+                    "cache-control": "no-store",
+                    "x-llm-proxy-cch-route": "public-status",
+                },
+            )
+        return JSONResponse(
+            payload,
+            status_code=status_code,
+            headers={
+                "cache-control": "no-store",
+                "x-llm-proxy-cch-route": "public-status",
+            },
+        )
+
+    async def public_site_meta(self, request: Request) -> Response:
+        client = self._require_client()
+        upstream = await client.get(
+            f"{self.config.base_url}/api/public-site-meta",
+            params=list(request.query_params.multi_items()),
+        )
+        return Response(
+            upstream.content,
+            status_code=upstream.status_code,
+            media_type="application/json",
+            headers={
+                "cache-control": "no-store",
+                "x-llm-proxy-cch-route": "public-site-meta",
+            },
+        )
+
     async def status_page(self, _: Request) -> Response:
         client = self._require_client()
         target = f"{self.config.base_url}/{self.config.locale}/status"
@@ -187,8 +240,12 @@ class CchStatusFeature:
                 media_type=content_type or None,
             )
 
+        generated_at = await self._get_status_page_public_status_generated_at()
         html = self._rewrite_root_relative_urls(upstream.text)
-        return HTMLResponse(self._inject_status_script(html))
+        return HTMLResponse(
+            self._inject_status_script(html, generated_at),
+            headers={"cache-control": "no-store"},
+        )
 
     async def get_weekly_consumption(self) -> dict[str, Any]:
         now_monotonic = time.monotonic()
@@ -325,15 +382,75 @@ class CchStatusFeature:
         return payload
 
     async def _get_public_status_groups(self) -> list[dict[str, Any]]:
-        client = self._require_client()
-        response = await client.get(
-            f"{self.config.base_url}/api/public-status",
-            params={"include": "groups"},
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = await self._get_public_status_payload("include=groups")
         groups = data.get("groups") if isinstance(data, dict) else None
         return [group for group in groups if isinstance(group, dict)] if isinstance(groups, list) else []
+
+    async def _get_status_page_public_status_generated_at(self) -> str | None:
+        try:
+            payload = await self._get_public_status_payload(
+                urlencode({"groupSlug": self.config.status_group_slug, "include": "defaults"})
+            )
+        except Exception:
+            LOGGER.exception("failed to fetch CCH public status generatedAt for status page")
+            return None
+        generated_at = payload.get("generatedAt")
+        return generated_at if isinstance(generated_at, str) else None
+
+    async def _get_cached_public_status(self, query: str) -> tuple[dict[str, Any], int]:
+        now_monotonic = time.monotonic()
+        cached = self._public_status_cache.get(query)
+        if cached is not None and now_monotonic < cached.expires_at:
+            return cached.payload, cached.status_code
+
+        async with self._public_status_lock:
+            now_monotonic = time.monotonic()
+            cached = self._public_status_cache.get(query)
+            if cached is not None and now_monotonic < cached.expires_at:
+                return cached.payload, cached.status_code
+
+            try:
+                payload, status_code = await self._fetch_public_status(query)
+            except Exception:
+                if cached is not None:
+                    LOGGER.exception(
+                        "failed to refresh CCH public status; serving stale cache",
+                        extra={"query": query},
+                    )
+                    return cached.payload, cached.status_code
+                raise
+
+            if status_code in (200, 503):
+                ttl_seconds = _public_status_ttl_seconds(
+                    payload,
+                    now=datetime.now(UTC),
+                    fallback_seconds=max(1, self.config.cache_ttl_seconds),
+                )
+                self._public_status_cache[query] = _PublicStatusCacheEntry(
+                    payload=payload,
+                    status_code=status_code,
+                    expires_at=now_monotonic + ttl_seconds,
+                )
+            return payload, status_code
+
+    async def _get_public_status_payload(self, query: str) -> dict[str, Any]:
+        payload, status_code = await self._get_cached_public_status(query)
+        if status_code >= 400:
+            raise RuntimeError(f"CCH public status failed with HTTP {status_code}")
+        return payload
+
+    async def _fetch_public_status(self, query: str) -> tuple[dict[str, Any], int]:
+        client = self._require_client()
+        url = f"{self.config.base_url}/api/public-status"
+        if query:
+            url = f"{url}?{query}"
+        response = await client.get(url)
+        if response.status_code not in (200, 400, 503):
+            response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("CCH public status returned unexpected data shape")
+        return data, response.status_code
 
     def _current_week_range(self) -> tuple[datetime, datetime]:
         tz = ZoneInfo(self.config.timezone)
@@ -519,12 +636,14 @@ class CchStatusFeature:
             raise RuntimeError(f"CCH action failed: {body.get('error', 'unknown error')}")
         return body.get("data")
 
-    def _inject_status_script(self, html: str) -> str:
+    def _inject_status_script(self, html: str, public_status_generated_at: str | None = None) -> str:
         script = f"""
 <script>
 (() => {{
   const statusGroupSlug = {json.dumps(self.config.status_group_slug)};
   const refreshMs = {max(1, self.config.cache_ttl_seconds) * 1000};
+  const publicStatusGeneratedAt = {json.dumps(public_status_generated_at)};
+  const publicStatusEndpoint = window.location.origin + "/api/public-status?include=defaults&groupSlug=" + encodeURIComponent(statusGroupSlug);
   const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
   const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
   const priceCoefficientsEndpoint = window.location.origin + "/cch/status/group-price-coefficients";
@@ -727,12 +846,48 @@ class CchStatusFeature:
       .then((body) => body && body.ok && scheduleRenderPriceCoefficients(body.data))
       .catch(() => {{}});
   }};
+  const restoreScrollAfterReload = () => {{
+    try {{
+      const value = window.sessionStorage.getItem("llm-proxy-cch-scroll-y");
+      if (!value) return;
+      window.sessionStorage.removeItem("llm-proxy-cch-scroll-y");
+      const y = Number(value);
+      if (Number.isFinite(y)) window.setTimeout(() => window.scrollTo(0, y), 0);
+    }} catch (_) {{}}
+  }};
+  let latestPublicStatusGeneratedAt = publicStatusGeneratedAt || null;
+  let reloadingForPublicStatus = false;
+  const reloadWhenPublicStatusChanges = () => {{
+    if (reloadingForPublicStatus) return;
+    fetch(publicStatusEndpoint, {{ cache: "no-store" }})
+      .then((response) => (response.status === 200 || response.status === 503)
+        ? response.json()
+        : Promise.reject(new Error("public status unavailable")))
+      .then((data) => {{
+        const nextGeneratedAt = data && typeof data.generatedAt === "string" ? data.generatedAt : "";
+        if (!nextGeneratedAt) return;
+        if (!latestPublicStatusGeneratedAt) {{
+          latestPublicStatusGeneratedAt = nextGeneratedAt;
+          return;
+        }}
+        if (nextGeneratedAt === latestPublicStatusGeneratedAt) return;
+        reloadingForPublicStatus = true;
+        try {{
+          window.sessionStorage.setItem("llm-proxy-cch-scroll-y", String(window.scrollY || 0));
+        }} catch (_) {{}}
+        window.location.reload();
+      }})
+      .catch(() => {{}});
+  }};
+  restoreScrollAfterReload();
   loadConsumption();
   loadLeaderboard();
   loadPriceCoefficients();
+  reloadWhenPublicStatusChanges();
   window.setInterval(loadConsumption, refreshMs);
   window.setInterval(loadLeaderboard, refreshMs);
   window.setInterval(loadPriceCoefficients, refreshMs);
+  window.setInterval(reloadWhenPublicStatusChanges, 30000);
 }})();
 </script>
 """
@@ -815,6 +970,39 @@ def _parse_status_group_provider_groups(value: Any) -> dict[str, list[str]] | No
             parsed[slug] = groups
 
     return parsed or None
+
+
+def _public_status_ttl_seconds(
+    payload: dict[str, Any],
+    now: datetime,
+    fallback_seconds: int,
+) -> float:
+    fresh_until = _datetime_from_iso(payload.get("freshUntil"))
+    if fresh_until is not None:
+        if fresh_until > now:
+            return max(1.0, (fresh_until - now).total_seconds())
+        return 30.0
+
+    defaults = payload.get("defaults")
+    if isinstance(defaults, dict):
+        interval_minutes = defaults.get("intervalMinutes")
+        if isinstance(interval_minutes, (int, float)) and interval_minutes > 0:
+            return max(1.0, float(interval_minutes) * 60.0)
+
+    return float(max(1, fallback_seconds))
+
+
+def _datetime_from_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _extract_group_price_coefficients(

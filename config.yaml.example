@@ -23,6 +23,7 @@ model_mappings:
 # When enabled, llm-proxy serves:
 #   GET /cch/status
 #   GET /cch/status/weekly-consumption
+#   GET /cch/status/weekly-user-consumption?apiKey=<user-api-key>
 # The weekly number is aggregated from CCH provider limit usage for providers
 # whose provider groups include provider_group.
 # cch_status:
@@ -35,6 +36,9 @@ model_mappings:
 #   timezone: "Asia/Shanghai"
 #   weekly_quota_usd: 500
 #   cache_ttl_seconds: 300
+#   # Enables the cached weekly user usage data used by:
+#   #   /cch/status/weekly-leaderboard
+#   #   /cch/status/weekly-user-consumption?apiKey=<user-api-key>
 #   weekly_leaderboard_enabled: false
 #   # Optional: map public status group slugs to backing provider groups.
 #   # Defaults to slug == provider group when omitted.

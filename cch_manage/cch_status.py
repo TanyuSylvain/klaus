@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, time as datetime_time, timedelta
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -84,6 +85,7 @@ class CchStatusFeature:
             Route("/cch/status", self.status_page, methods=["GET"]),
             Route("/cch/status/weekly-consumption", self.weekly_consumption, methods=["GET"]),
             Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
+            Route("/cch/status/weekly-user-consumption", self.weekly_user_consumption, methods=["GET"]),
             Route("/cch/status/group-price-coefficients", self.group_price_coefficients, methods=["GET"]),
         ]
 
@@ -107,12 +109,37 @@ class CchStatusFeature:
 
     async def weekly_leaderboard(self, _: Request) -> JSONResponse:
         try:
-            payload = await self.get_weekly_leaderboard()
+            payload = self._public_weekly_leaderboard_payload(
+                await self.get_weekly_leaderboard()
+            )
         except Exception as exc:
             LOGGER.exception("failed to build CCH weekly leaderboard")
             return JSONResponse(
                 {"ok": False, "error": str(exc)},
                 status_code=502,
+            )
+        return JSONResponse({"ok": True, "data": payload})
+
+    async def weekly_user_consumption(self, request: Request) -> JSONResponse:
+        api_key = (
+            request.query_params.get("apiKey")
+            or request.query_params.get("api_key")
+            or ""
+        ).strip()
+        if not api_key:
+            return JSONResponse(
+                {"ok": False, "error": "apiKey query parameter is required"},
+                status_code=400,
+            )
+
+        payload = self.get_cached_weekly_user_consumption(api_key)
+        if payload is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "weekly user usage is not available in cache",
+                },
+                status_code=404,
             )
         return JSONResponse({"ok": True, "data": payload})
 
@@ -199,7 +226,11 @@ class CchStatusFeature:
             "weekStart": week_start.isoformat(),
             "weekEnd": week_end.isoformat(),
             "weeklyLeaderboardEnabled": self.config.weekly_leaderboard_enabled,
-            "leaderboard": leaderboard,
+            "leaderboard": [
+                _public_leaderboard_entry(entry)
+                for entry in _active_leaderboard_entries(leaderboard)[:3]
+            ],
+            "userUsage": leaderboard,
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }
         self._leaderboard_cache = payload
@@ -207,6 +238,43 @@ class CchStatusFeature:
             now_monotonic + max(1, self.config.cache_ttl_seconds)
         )
         return payload
+
+    def _public_weekly_leaderboard_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in payload.items()
+            if key != "userUsage"
+        }
+
+    def get_cached_weekly_user_consumption(self, api_key: str) -> dict[str, Any] | None:
+        if self._leaderboard_cache is None:
+            return None
+
+        target_hash = _api_key_hash(api_key)
+        for entry in self._leaderboard_cache.get("userUsage", []):
+            if not isinstance(entry, dict):
+                continue
+            key_hashes = entry.get("apiKeyHashes")
+            if not isinstance(key_hashes, list) or target_hash not in key_hashes:
+                continue
+
+            now_monotonic = time.monotonic()
+            cache_expires_at = self._leaderboard_cache_expires_at
+            return {
+                "weekStart": self._leaderboard_cache.get("weekStart"),
+                "weekEnd": self._leaderboard_cache.get("weekEnd"),
+                "userId": entry.get("userId"),
+                "userName": entry.get("name"),
+                "usedUsd": entry.get("usedUsd"),
+                "requestCount": entry.get("requestCount"),
+                "rank": entry.get("rank"),
+                "generatedAt": self._leaderboard_cache.get("generatedAt"),
+                "cacheExpiresInSeconds": max(0, round(cache_expires_at - now_monotonic, 3)),
+                "stale": now_monotonic >= cache_expires_at,
+                "source": "weeklyLeaderboardCache",
+            }
+
+        return None
 
     async def get_group_price_coefficients(self) -> dict[str, Any]:
         now_monotonic = time.monotonic()
@@ -261,16 +329,41 @@ class CchStatusFeature:
         week_end: datetime,
     ) -> list[dict[str, Any]]:
         tz = ZoneInfo(self.config.timezone)
-        data = await self._post_action(
+        statistics_data = await self._post_action(
             "/api/actions/statistics/getUserStatistics",
             {"timeRange": "7days"},
         )
+        statistics_users = _statistics_users(
+            statistics_data if isinstance(statistics_data, list) else [statistics_data]
+        )
+        api_keys_by_user = await self._get_api_key_hashes_by_user(statistics_users)
         return _extract_weekly_leaderboard(
-            data,
+            statistics_data,
             week_start,
             week_end,
             tz,
+            api_keys_by_user,
         )
+
+    async def _get_api_key_hashes_by_user(
+        self,
+        statistics_users: list[dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        hashes_by_user: dict[str, list[str]] = {}
+        for user in statistics_users:
+            user_id = user.get("id")
+            data_key = user.get("dataKey")
+            if user_id is None or not isinstance(data_key, str):
+                continue
+
+            keys_data = await self._post_action(
+                "/api/actions/keys/getKeys",
+                {"userId": int(user_id)},
+            )
+            key_hashes = _extract_api_key_hashes(keys_data)
+            if key_hashes:
+                hashes_by_user[data_key] = key_hashes
+        return hashes_by_user
 
     async def _get_claude_group_providers(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         data = await self._post_action("/api/actions/providers/getProviders", {})
@@ -776,19 +869,23 @@ def _extract_weekly_leaderboard(
     week_start: datetime,
     week_end: datetime,
     tz: ZoneInfo,
+    api_keys_by_user: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     datasets = data if isinstance(data, list) else [data]
     users = _statistics_users(datasets)
     if not users:
         return []
 
+    api_keys_by_user = api_keys_by_user or {}
     totals: dict[str, dict[str, Any]] = {}
     for user in users:
         data_key = user["dataKey"]
         totals[data_key] = {
+            "userId": user.get("id"),
             "name": user["name"],
             "used": Decimal("0"),
             "requests": 0,
+            "apiKeyHashes": api_keys_by_user.get(data_key, []),
         }
 
     for dataset in datasets:
@@ -809,26 +906,24 @@ def _extract_weekly_leaderboard(
                 total["used"] += _decimal_from_any(row.get(f"{data_key}_cost"))
                 total["requests"] += _int_from_any(row.get(f"{data_key}_calls"))
 
-    ranked = [
-        total
-        for total in totals.values()
-        if total["used"] > 0 or total["requests"] > 0
-    ]
+    ranked = list(totals.values())
     ranked.sort(key=lambda item: (-item["used"], -item["requests"], item["name"].casefold()))
 
     return [
         {
             "rank": index + 1,
+            "userId": item["userId"],
             "name": item["name"],
             "usedUsd": _money_float(item["used"]),
             "requestCount": item["requests"],
+            "apiKeyHashes": item["apiKeyHashes"],
         }
-        for index, item in enumerate(ranked[:3])
+        for index, item in enumerate(ranked)
     ]
 
 
-def _statistics_users(datasets: list[Any]) -> list[dict[str, str]]:
-    users_by_key: dict[str, dict[str, str]] = {}
+def _statistics_users(datasets: list[Any]) -> list[dict[str, Any]]:
+    users_by_key: dict[str, dict[str, Any]] = {}
     for dataset in datasets:
         if not isinstance(dataset, dict):
             continue
@@ -842,11 +937,50 @@ def _statistics_users(datasets: list[Any]) -> list[dict[str, str]]:
             if not isinstance(data_key, str) or not data_key:
                 continue
             name = user.get("name")
+            user_id = user.get("id")
+            parsed_user_id = _int_from_any(user_id)
             users_by_key[data_key] = {
                 "dataKey": data_key,
                 "name": str(name) if name else "Unknown",
+                "id": parsed_user_id if parsed_user_id > 0 else None,
             }
     return list(users_by_key.values())
+
+
+def _extract_api_key_hashes(data: Any) -> list[str]:
+    if not isinstance(data, list):
+        return []
+
+    key_hashes: set[str] = set()
+    for key in data:
+        if not isinstance(key, dict):
+            continue
+        api_key = key.get("key")
+        if isinstance(api_key, str) and api_key:
+            key_hashes.add(_api_key_hash(api_key))
+
+    return sorted(key_hashes)
+
+
+def _public_leaderboard_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in entry.items()
+        if key != "apiKeyHashes"
+    }
+
+
+def _active_leaderboard_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in entries
+        if _decimal_from_any(entry.get("usedUsd")) > 0
+        or _int_from_any(entry.get("requestCount")) > 0
+    ]
+
+
+def _api_key_hash(api_key: str) -> str:
+    return sha256(api_key.encode("utf-8")).hexdigest()
 
 
 def _parse_statistics_date(value: Any, tz: ZoneInfo) -> datetime | None:

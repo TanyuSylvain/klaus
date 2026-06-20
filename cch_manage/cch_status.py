@@ -3,7 +3,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, time as datetime_time, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
 from typing import Any
@@ -27,6 +27,7 @@ class CchStatusConfig:
     timezone: str = "Asia/Shanghai"
     weekly_quota_usd: Decimal | None = None
     cache_ttl_seconds: int = 300
+    weekly_leaderboard_enabled: bool = False
     auto_manage_provider_group_quota: bool = False
     auto_disable_threshold_pct: Decimal = Decimal("100")
 
@@ -53,6 +54,7 @@ class CchStatusConfig:
             timezone=str(raw.get("timezone", "Asia/Shanghai")),
             weekly_quota_usd=weekly_quota_usd,
             cache_ttl_seconds=int(raw.get("cache_ttl_seconds", 300)),
+            weekly_leaderboard_enabled=bool(raw.get("weekly_leaderboard_enabled", False)),
             auto_manage_provider_group_quota=bool(
                 raw.get("auto_manage_provider_group_quota", False)
             ),
@@ -66,12 +68,15 @@ class CchStatusFeature:
         self.client: httpx.AsyncClient | None = None
         self._cache: dict[str, Any] | None = None
         self._cache_expires_at = 0.0
+        self._leaderboard_cache: dict[str, Any] | None = None
+        self._leaderboard_cache_expires_at = 0.0
         self._auto_disabled_provider_ids: set[int] = set()
 
     def routes(self) -> list[Route]:
         return [
             Route("/cch/status", self.status_page, methods=["GET"]),
             Route("/cch/status/weekly-consumption", self.weekly_consumption, methods=["GET"]),
+            Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
         ]
 
     async def start(self, client_kwargs: dict[str, Any]) -> None:
@@ -86,6 +91,17 @@ class CchStatusFeature:
             payload = await self.get_weekly_consumption()
         except Exception as exc:
             LOGGER.exception("failed to build CCH weekly consumption")
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"ok": True, "data": payload})
+
+    async def weekly_leaderboard(self, _: Request) -> JSONResponse:
+        try:
+            payload = await self.get_weekly_leaderboard()
+        except Exception as exc:
+            LOGGER.exception("failed to build CCH weekly leaderboard")
             return JSONResponse(
                 {"ok": False, "error": str(exc)},
                 status_code=502,
@@ -139,11 +155,38 @@ class CchStatusFeature:
             "providerIds": provider_ids,
             "source": "providerLimitUsage",
             "autoManageProviderGroupQuota": auto_manage,
+            "weeklyLeaderboardEnabled": self.config.weekly_leaderboard_enabled,
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }
 
         self._cache = payload
         self._cache_expires_at = now_monotonic + max(1, self.config.cache_ttl_seconds)
+        return payload
+
+    async def get_weekly_leaderboard(self) -> dict[str, Any]:
+        now_monotonic = time.monotonic()
+        if (
+            self._leaderboard_cache is not None
+            and now_monotonic < self._leaderboard_cache_expires_at
+        ):
+            return self._leaderboard_cache
+
+        week_start, week_end = self._current_week_range()
+        leaderboard: list[dict[str, Any]] = []
+        if self.config.weekly_leaderboard_enabled:
+            leaderboard = await self._get_weekly_leaderboard(week_start, week_end)
+
+        payload = {
+            "weekStart": week_start.isoformat(),
+            "weekEnd": week_end.isoformat(),
+            "weeklyLeaderboardEnabled": self.config.weekly_leaderboard_enabled,
+            "leaderboard": leaderboard,
+            "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
+        }
+        self._leaderboard_cache = payload
+        self._leaderboard_cache_expires_at = (
+            now_monotonic + max(1, self.config.cache_ttl_seconds)
+        )
         return payload
 
     def _current_week_range(self) -> tuple[datetime, datetime]:
@@ -156,6 +199,23 @@ class CchStatusFeature:
             microsecond=0,
         )
         return week_start, week_start + timedelta(days=7)
+
+    async def _get_weekly_leaderboard(
+        self,
+        week_start: datetime,
+        week_end: datetime,
+    ) -> list[dict[str, Any]]:
+        tz = ZoneInfo(self.config.timezone)
+        data = await self._post_action(
+            "/api/actions/statistics/getUserStatistics",
+            {"timeRange": "7days"},
+        )
+        return _extract_weekly_leaderboard(
+            data,
+            week_start,
+            week_end,
+            tz,
+        )
 
     async def _get_claude_group_providers(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         data = await self._post_action("/api/actions/providers/getProviders", {})
@@ -294,11 +354,28 @@ class CchStatusFeature:
 (() => {{
   const statusGroupSlug = {json.dumps(self.config.status_group_slug)};
   const refreshMs = {max(1, self.config.cache_ttl_seconds) * 1000};
-  const endpoint = window.location.origin + "/cch/status/weekly-consumption";
+  const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
+  const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
   const money = (value) => typeof value === "number"
     ? "$" + value.toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})
     : "—";
+  const dateLabel = (value) => {{
+    const date = value ? new Date(value) : null;
+    if (!date || Number.isNaN(date.getTime())) return "";
+    return `${{date.getMonth() + 1}}月${{date.getDate()}}日`;
+  }};
+  const compactNumber = (value) => typeof value === "number"
+    ? value.toLocaleString(undefined, {{ maximumFractionDigits: 0 }})
+    : "0";
+  const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }}[char]));
   const percent = (value) => typeof value === "number" ? value.toFixed(2) + "%" : "—";
+  const alpha = (token, pct) => `color-mix(in oklab, var(${{token}}) ${{pct}}%, transparent)`;
   const palette = (value) => {{
     if (typeof value !== "number") {{
       return {{
@@ -334,9 +411,76 @@ class CchStatusFeature:
     if (!link) return null;
     return link.closest("div.flex.items-center.gap-2") || link.parentElement;
   }};
-  const render = (data) => {{
+  const findFirstGroupCard = () => {{
     const header = findGroupHeader();
-    if (!header) return;
+    if (!header) return null;
+    return header.closest("section") || header.closest('[class*="rounded"][class*="border"]');
+  }};
+  const scheduleRenderQuota = (data, attempts = 20) => {{
+    if (renderQuota(data) || attempts <= 0) return;
+    window.setTimeout(() => scheduleRenderQuota(data, attempts - 1), 250);
+  }};
+  const scheduleRenderLeaderboard = (data, attempts = 20) => {{
+    if (renderLeaderboard(data) || attempts <= 0) return;
+    window.setTimeout(() => scheduleRenderLeaderboard(data, attempts - 1), 250);
+  }};
+  const trophyStyle = (rank) => {{
+    if (rank === 1) return "filter:none;background:rgb(250 204 21 / .16);border-color:rgb(250 204 21 / .55);";
+    if (rank === 2) return "filter:grayscale(1) brightness(1.18);background:rgb(148 163 184 / .16);border-color:rgb(148 163 184 / .55);";
+    return "filter:sepia(1) saturate(1.6) hue-rotate(330deg) brightness(.88);background:rgb(180 83 9 / .14);border-color:rgb(180 83 9 / .45);";
+  }};
+  const renderLeaderboard = (data) => {{
+    if (!data.weeklyLeaderboardEnabled) return true;
+    const entries = Array.isArray(data.leaderboard) ? data.leaderboard.slice(0, 3) : [];
+    const existing = document.getElementById("cch-weekly-leaderboard");
+    if (entries.length === 0) {{
+      if (existing) existing.remove();
+      return true;
+    }}
+
+    const firstGroupCard = findFirstGroupCard();
+    if (!firstGroupCard || !firstGroupCard.parentElement) return false;
+
+    let board = document.getElementById("cch-weekly-leaderboard");
+    if (!board) {{
+      board = document.createElement("section");
+      board.id = "cch-weekly-leaderboard";
+      board.style.cssText = "margin:0 0 16px 0;";
+      firstGroupCard.parentElement.insertBefore(board, firstGroupCard);
+    }}
+
+    const cards = entries.map((entry) => `
+      <article style="min-width:0;border:1px solid ${{alpha("--border", 60)}};border-radius:12px;background:${{alpha("--card", 40)}};padding:16px;display:flex;align-items:center;gap:12px;backdrop-filter:blur(4px);box-shadow:0 1px 2px rgb(0 0 0 / .05);">
+        <div style="width:32px;height:32px;flex:0 0 auto;border:1px solid ${{alpha("--border", 60)}};border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;line-height:1;background:${{alpha("--muted", 30)}};${{trophyStyle(entry.rank)}}">🏆</div>
+        <div style="min-width:0;flex:1 1 auto;display:flex;align-items:center;justify-content:space-between;gap:10px;">
+          <div style="min-width:0;">
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:.025em;color:var(--muted-foreground);">第${{entry.rank}}名</div>
+            <div style="margin-top:2px;font-size:14px;font-weight:600;color:var(--foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${{escapeHtml(entry.name || "未知用户")}}</div>
+          </div>
+          <div style="flex:0 0 auto;text-align:right;">
+            <div style="font-size:14px;font-weight:700;color:var(--foreground);">${{money(entry.usedUsd)}}</div>
+            <div style="margin-top:2px;font-size:12px;color:var(--muted-foreground);">${{compactNumber(entry.requestCount)}} 次请求</div>
+          </div>
+        </div>
+      </article>
+    `).join("");
+
+    const rangeStart = dateLabel(data.weekStart);
+    const rangeEndDate = data.weekEnd ? new Date(data.weekEnd) : null;
+    if (rangeEndDate && !Number.isNaN(rangeEndDate.getTime())) {{
+      rangeEndDate.setDate(rangeEndDate.getDate() - 1);
+    }}
+    const rangeEnd = dateLabel(rangeEndDate);
+    const rangeNote = rangeStart && rangeEnd ? `（${{rangeStart}}-${{rangeEnd}}）` : "";
+    board.innerHTML = `
+      <div style="margin-bottom:10px;font-size:14px;font-weight:600;color:var(--foreground);">本周消费排行榜${{rangeNote}}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">${{cards}}</div>
+    `;
+    return true;
+  }};
+  const renderQuota = (data) => {{
+    const header = findGroupHeader();
+    if (!header) return false;
     let badge = document.getElementById("cch-weekly-consumption");
     if (!badge) {{
       badge = document.createElement("div");
@@ -351,15 +495,24 @@ class CchStatusFeature:
       `<span style="${{style}}">${{percent(data.usagePct)}}</span>`,
       `<span style="${{style}}">剩余 ${{money(data.remainingUsd)}}</span>`,
     ].join("");
+    return true;
   }};
-  const load = () => {{
-    fetch(endpoint, {{ cache: "no-store" }})
+  const loadConsumption = () => {{
+    fetch(consumptionEndpoint, {{ cache: "no-store" }})
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("weekly consumption unavailable")))
-      .then((body) => body && body.ok && render(body.data))
+      .then((body) => body && body.ok && scheduleRenderQuota(body.data))
       .catch(() => {{}});
   }};
-  load();
-  window.setInterval(load, refreshMs);
+  const loadLeaderboard = () => {{
+    fetch(leaderboardEndpoint, {{ cache: "no-store" }})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("weekly leaderboard unavailable")))
+      .then((body) => body && body.ok && scheduleRenderLeaderboard(body.data))
+      .catch(() => {{}});
+  }};
+  loadConsumption();
+  loadLeaderboard();
+  window.setInterval(loadConsumption, refreshMs);
+  window.setInterval(loadLeaderboard, refreshMs);
 }})();
 </script>
 """
@@ -422,6 +575,128 @@ def _parse_provider_groups(value: Any) -> list[str]:
     if not isinstance(value, str):
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _extract_weekly_leaderboard(
+    data: Any,
+    week_start: datetime,
+    week_end: datetime,
+    tz: ZoneInfo,
+) -> list[dict[str, Any]]:
+    datasets = data if isinstance(data, list) else [data]
+    users = _statistics_users(datasets)
+    if not users:
+        return []
+
+    totals: dict[str, dict[str, Any]] = {}
+    for user in users:
+        data_key = user["dataKey"]
+        totals[data_key] = {
+            "name": user["name"],
+            "used": Decimal("0"),
+            "requests": 0,
+        }
+
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
+        chart_data = dataset.get("chartData")
+        if not isinstance(chart_data, list):
+            continue
+
+        for row in chart_data:
+            if not isinstance(row, dict):
+                continue
+            row_date = _parse_statistics_date(row.get("date"), tz)
+            if row_date is None or not (week_start <= row_date < week_end):
+                continue
+
+            for data_key, total in totals.items():
+                total["used"] += _decimal_from_any(row.get(f"{data_key}_cost"))
+                total["requests"] += _int_from_any(row.get(f"{data_key}_calls"))
+
+    ranked = [
+        total
+        for total in totals.values()
+        if total["used"] > 0 or total["requests"] > 0
+    ]
+    ranked.sort(key=lambda item: (-item["used"], -item["requests"], item["name"].casefold()))
+
+    return [
+        {
+            "rank": index + 1,
+            "name": item["name"],
+            "usedUsd": _money_float(item["used"]),
+            "requestCount": item["requests"],
+        }
+        for index, item in enumerate(ranked[:3])
+    ]
+
+
+def _statistics_users(datasets: list[Any]) -> list[dict[str, str]]:
+    users_by_key: dict[str, dict[str, str]] = {}
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
+        users = dataset.get("users")
+        if not isinstance(users, list):
+            continue
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            data_key = user.get("dataKey")
+            if not isinstance(data_key, str) or not data_key:
+                continue
+            name = user.get("name")
+            users_by_key[data_key] = {
+                "dataKey": data_key,
+                "name": str(name) if name else "Unknown",
+            }
+    return list(users_by_key.values())
+
+
+def _parse_statistics_date(value: Any, tz: ZoneInfo) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    text = value.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return _parse_daily_statistics_date(text, tz)
+
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
+
+
+def _parse_daily_statistics_date(value: str, tz: ZoneInfo) -> datetime:
+    day = datetime.fromisoformat(value).date()
+    offset = tz.utcoffset(datetime.combine(day, datetime_time.min, tzinfo=UTC))
+    if offset and offset > timedelta():
+        day += timedelta(days=1)
+    return datetime.combine(day, datetime_time.min, tzinfo=tz)
+
+
+def _decimal_from_any(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
+def _int_from_any(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _money_float(value: Decimal | None) -> float | None:

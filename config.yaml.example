@@ -35,5 +35,6 @@ model_mappings:
 #   timezone: "Asia/Shanghai"
 #   weekly_quota_usd: 500
 #   cache_ttl_seconds: 300
+#   weekly_leaderboard_enabled: false
 #   auto_manage_provider_group_quota: false
 #   auto_disable_threshold_pct: 100

@@ -191,7 +191,7 @@ class CchStatusFeature:
 
     async def public_status(self, request: Request) -> JSONResponse:
         try:
-            payload, status_code = await self._get_cached_public_status(request.url.query)
+            payload, status_code, expires_at = await self._get_cached_public_status(request.url.query)
         except Exception as exc:
             LOGGER.exception("failed to proxy CCH public status")
             return JSONResponse(
@@ -208,6 +208,7 @@ class CchStatusFeature:
             headers={
                 "cache-control": "no-store",
                 "x-llm-proxy-cch-route": "public-status",
+                "x-llm-proxy-cch-cache-expires-in-seconds": _seconds_until(expires_at),
             },
         )
 
@@ -397,17 +398,17 @@ class CchStatusFeature:
         generated_at = payload.get("generatedAt")
         return generated_at if isinstance(generated_at, str) else None
 
-    async def _get_cached_public_status(self, query: str) -> tuple[dict[str, Any], int]:
+    async def _get_cached_public_status(self, query: str) -> tuple[dict[str, Any], int, float]:
         now_monotonic = time.monotonic()
         cached = self._public_status_cache.get(query)
         if cached is not None and now_monotonic < cached.expires_at:
-            return cached.payload, cached.status_code
+            return cached.payload, cached.status_code, cached.expires_at
 
         async with self._public_status_lock:
             now_monotonic = time.monotonic()
             cached = self._public_status_cache.get(query)
             if cached is not None and now_monotonic < cached.expires_at:
-                return cached.payload, cached.status_code
+                return cached.payload, cached.status_code, cached.expires_at
 
             try:
                 payload, status_code = await self._fetch_public_status(query)
@@ -417,24 +418,26 @@ class CchStatusFeature:
                         "failed to refresh CCH public status; serving stale cache",
                         extra={"query": query},
                     )
-                    return cached.payload, cached.status_code
+                    return cached.payload, cached.status_code, cached.expires_at
                 raise
 
+            expires_at = now_monotonic
             if status_code in (200, 503):
                 ttl_seconds = _public_status_ttl_seconds(
                     payload,
                     now=datetime.now(UTC),
                     fallback_seconds=max(1, self.config.cache_ttl_seconds),
                 )
+                expires_at = now_monotonic + ttl_seconds
                 self._public_status_cache[query] = _PublicStatusCacheEntry(
                     payload=payload,
                     status_code=status_code,
-                    expires_at=now_monotonic + ttl_seconds,
+                    expires_at=expires_at,
                 )
-            return payload, status_code
+            return payload, status_code, expires_at
 
     async def _get_public_status_payload(self, query: str) -> dict[str, Any]:
-        payload, status_code = await self._get_cached_public_status(query)
+        payload, status_code, _ = await self._get_cached_public_status(query)
         if status_code >= 400:
             raise RuntimeError(f"CCH public status failed with HTTP {status_code}")
         return payload
@@ -857,12 +860,27 @@ class CchStatusFeature:
   }};
   let latestPublicStatusGeneratedAt = publicStatusGeneratedAt || null;
   let reloadingForPublicStatus = false;
+  let publicStatusReloadTimer = null;
+  const publicStatusPollDelayMs = (response) => {{
+    const rawSeconds = Number(response.headers.get("x-llm-proxy-cch-cache-expires-in-seconds"));
+    const seconds = Number.isFinite(rawSeconds) && rawSeconds > 0 ? rawSeconds : refreshMs / 1000;
+    return Math.max(1000, seconds * 1000) + Math.floor(Math.random() * 5000);
+  }};
+  const schedulePublicStatusReloadCheck = (delayMs) => {{
+    if (publicStatusReloadTimer !== null) window.clearTimeout(publicStatusReloadTimer);
+    publicStatusReloadTimer = window.setTimeout(reloadWhenPublicStatusChanges, delayMs);
+  }};
   const reloadWhenPublicStatusChanges = () => {{
     if (reloadingForPublicStatus) return;
+    let nextDelayMs = refreshMs;
     fetch(publicStatusEndpoint, {{ cache: "no-store" }})
-      .then((response) => (response.status === 200 || response.status === 503)
-        ? response.json()
-        : Promise.reject(new Error("public status unavailable")))
+      .then((response) => {{
+        if (response.status !== 200 && response.status !== 503) {{
+          throw new Error("public status unavailable");
+        }}
+        nextDelayMs = publicStatusPollDelayMs(response);
+        return response.json();
+      }})
       .then((data) => {{
         const nextGeneratedAt = data && typeof data.generatedAt === "string" ? data.generatedAt : "";
         if (!nextGeneratedAt) return;
@@ -877,7 +895,10 @@ class CchStatusFeature:
         }} catch (_) {{}}
         window.location.reload();
       }})
-      .catch(() => {{}});
+      .catch(() => {{}})
+      .finally(() => {{
+        if (!reloadingForPublicStatus) schedulePublicStatusReloadCheck(nextDelayMs);
+      }});
   }};
   restoreScrollAfterReload();
   loadConsumption();
@@ -887,7 +908,6 @@ class CchStatusFeature:
   window.setInterval(loadConsumption, refreshMs);
   window.setInterval(loadLeaderboard, refreshMs);
   window.setInterval(loadPriceCoefficients, refreshMs);
-  window.setInterval(reloadWhenPublicStatusChanges, 30000);
 }})();
 </script>
 """
@@ -990,6 +1010,10 @@ def _public_status_ttl_seconds(
             return max(1.0, float(interval_minutes) * 60.0)
 
     return float(max(1, fallback_seconds))
+
+
+def _seconds_until(monotonic_deadline: float) -> str:
+    return str(max(1, int(round(monotonic_deadline - time.monotonic()))))
 
 
 def _datetime_from_iso(value: Any) -> datetime | None:

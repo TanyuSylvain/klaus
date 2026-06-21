@@ -97,7 +97,9 @@ class CchStatusFeature:
         return [
             Route("/api/public-status", self.public_status, methods=["GET"]),
             Route("/api/public-site-meta", self.public_site_meta, methods=["GET"]),
-            Route("/cch/status", self.status_page, methods=["GET"]),
+            Route("/_next/{path:path}", self.next_asset, methods=["GET"]),
+            Route(f"/{self.config.locale}/status", self.status_page, methods=["GET"]),
+            Route(f"/{self.config.locale}/status/{{group_slug}}", self.status_page, methods=["GET"]),
             Route("/cch/status/weekly-consumption", self.weekly_consumption, methods=["GET"]),
             Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
             Route("/cch/status/weekly-user-consumption", self.weekly_user_consumption, methods=["GET"]),
@@ -228,9 +230,33 @@ class CchStatusFeature:
             },
         )
 
-    async def status_page(self, _: Request) -> Response:
+    async def next_asset(self, request: Request) -> Response:
         client = self._require_client()
-        target = f"{self.config.base_url}/{self.config.locale}/status"
+        path = request.path_params.get("path", "")
+        target = f"{self.config.base_url}/_next/{path}"
+        upstream = await client.get(
+            target,
+            params=list(request.query_params.multi_items()),
+        )
+        headers = {
+            key: value
+            for key, value in upstream.headers.multi_items()
+            if key.lower() in {"cache-control", "etag", "last-modified"}
+        }
+        return Response(
+            upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type") or None,
+            headers=headers,
+        )
+
+    async def status_page(self, request: Request) -> Response:
+        client = self._require_client()
+        group_slug = request.path_params.get("group_slug")
+        path = f"/{self.config.locale}/status"
+        if group_slug:
+            path = f"{path}/{group_slug}"
+        target = f"{self.config.base_url}{path}"
         upstream = await client.get(target)
 
         content_type = upstream.headers.get("content-type", "")
@@ -900,14 +926,28 @@ class CchStatusFeature:
         if (!reloadingForPublicStatus) schedulePublicStatusReloadCheck(nextDelayMs);
       }});
   }};
-  restoreScrollAfterReload();
-  loadConsumption();
-  loadLeaderboard();
-  loadPriceCoefficients();
-  reloadWhenPublicStatusChanges();
-  window.setInterval(loadConsumption, refreshMs);
-  window.setInterval(loadLeaderboard, refreshMs);
-  window.setInterval(loadPriceCoefficients, refreshMs);
+  const startEnhancements = () => {{
+    restoreScrollAfterReload();
+    loadConsumption();
+    loadLeaderboard();
+    loadPriceCoefficients();
+    reloadWhenPublicStatusChanges();
+    window.setInterval(loadConsumption, refreshMs);
+    window.setInterval(loadLeaderboard, refreshMs);
+    window.setInterval(loadPriceCoefficients, refreshMs);
+  }};
+  const waitForHydration = (attempts = 80) => {{
+    if (window.next && document.querySelector("next-route-announcer")) {{
+      startEnhancements();
+      return;
+    }}
+    if (attempts <= 0) {{
+      startEnhancements();
+      return;
+    }}
+    window.setTimeout(() => waitForHydration(attempts - 1), 100);
+  }};
+  waitForHydration();
 }})();
 </script>
 """
@@ -918,7 +958,11 @@ class CchStatusFeature:
     def _rewrite_root_relative_urls(self, html: str) -> str:
         def replace(match: re.Match[str]) -> str:
             url = match.group("url")
-            if url.startswith("//"):
+            if (
+                url.startswith("//")
+                or url.startswith("/_next/")
+                or url.startswith(f"/{self.config.locale}/status")
+            ):
                 return match.group(0)
             return match.group("prefix") + escape(self.config.base_url + url, quote=True)
 

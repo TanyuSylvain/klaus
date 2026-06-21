@@ -1,7 +1,10 @@
 import json
 import logging
+import re
 import sqlite3
+import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 import httpx
@@ -23,8 +26,18 @@ REWRITTEN_ENTITY_HEADERS = frozenset({
 })
 
 cfg: dict = {}
-UPSTREAM_URL: str = ""
-MAPPINGS: dict[str, str] = {}
+
+_PROVIDER_PREFIX_RE = re.compile(r"^\[([a-zA-Z0-9_-]+)\]")
+
+
+@dataclass
+class Provider:
+    identifier: str
+    upstream_url: str
+    models: dict[str, str]
+
+
+PROVIDERS: dict[str, Provider] = {}
 MODEL_CLIENT: httpx.AsyncClient | None = None
 LOGGER = logging.getLogger("llm_proxy")
 
@@ -61,7 +74,7 @@ def log_image_request(api_key: str, elapsed_ms: float):
         )
 
 
-def models_payload() -> dict:
+def models_payload(provider: Provider) -> dict:
     return {
         "data": [
             {
@@ -70,14 +83,38 @@ def models_payload() -> dict:
                 "display_name": model_name,
                 "created_at": "2025-01-01T00:00:00Z",
             }
-            for model_name in MAPPINGS
+            for model_name in provider.models
         ],
         "has_more": False,
     }
 
 
-async def list_models(_: Request) -> JSONResponse:
-    return JSONResponse(models_payload())
+async def list_models(request: Request) -> JSONResponse:
+    provider = _resolve_provider(request)
+    if provider is None:
+        return JSONResponse(
+            {"error": {"message": "Invalid API key"}},
+            status_code=401,
+        )
+    return JSONResponse(models_payload(provider))
+
+
+def _split_auth_token(auth: str) -> tuple[str | None, str]:
+    match = _PROVIDER_PREFIX_RE.match(auth)
+    if not match:
+        return None, auth
+    return match.group(1), auth[match.end():]
+
+
+def _resolve_provider(request: Request) -> Provider | None:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:].strip()
+    identifier, _ = _split_auth_token(token)
+    if identifier is None:
+        return None
+    return PROVIDERS.get(identifier)
 
 
 def _is_anthropic_messages_path(path: str) -> bool:
@@ -218,6 +255,13 @@ async def _rewrite_anthropic_response(upstream_response, original_model: str):
 
 
 async def proxy(request: Request) -> StreamingResponse:
+    provider = _resolve_provider(request)
+    if provider is None:
+        return JSONResponse(
+            {"error": {"message": "Invalid API key"}},
+            status_code=401,
+        )
+
     raw_body = await request.body()
     original_model: str | None = None
     rewritten_model: str | None = None
@@ -228,7 +272,7 @@ async def proxy(request: Request) -> StreamingResponse:
             data = json.loads(raw_body)
             if isinstance(data, dict) and "model" in data:
                 original_model = data["model"]
-                rewritten_model = MAPPINGS.get(original_model, original_model)
+                rewritten_model = provider.models.get(original_model, original_model)
                 LOGGER.info(
                     "model rewrite check path=%s inbound_model=%r outbound_model=%r",
                     request.url.path,
@@ -245,11 +289,17 @@ async def proxy(request: Request) -> StreamingResponse:
         k: v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP
     }
-    upstream_headers["host"] = httpx.URL(UPSTREAM_URL).host
+    upstream_headers["host"] = httpx.URL(provider.upstream_url).host
+
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip()
+    _, real_key = _split_auth_token(token)
+    upstream_headers["authorization"] = f"Bearer {real_key}"
+
     if _should_rewrite_anthropic_response(request.url.path, original_model, rewritten_model):
         upstream_headers["accept-encoding"] = "identity"
 
-    target = UPSTREAM_URL + request.url.path
+    target = provider.upstream_url + request.url.path
     if request.url.query:
         target += "?" + request.url.query
 
@@ -491,7 +541,7 @@ def make_lifespan(cch_status_feature: CchStatusFeature | None = None):
 
 
 def main():
-    global cfg, UPSTREAM_URL, MAPPINGS, MCP_UPSTREAM_URL, MCP_API_KEY, MCP_ENABLED
+    global cfg, PROVIDERS, MCP_UPSTREAM_URL, MCP_API_KEY, MCP_ENABLED
     global IMAGE_UPSTREAM_URL, IMAGE_API_KEY, IMAGE_ENABLED, IMAGE_ALLOWED_MODELS
 
     logging.basicConfig(
@@ -502,8 +552,37 @@ def main():
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    UPSTREAM_URL = cfg["model_mappings"]["upstream_url"].rstrip("/")
-    MAPPINGS = cfg["model_mappings"].get("models", {})
+    providers_cfg = cfg.get("providers")
+    if not providers_cfg:
+        LOGGER.error("Missing required 'providers' configuration")
+        sys.exit(1)
+
+    seen_identifiers: set[str] = set()
+    for entry in providers_cfg:
+        identifier = entry.get("identifier")
+        upstream_url = entry.get("upstream_url", "").rstrip("/")
+        models = entry.get("models", {})
+        if not identifier or not upstream_url:
+            LOGGER.error(
+                "Invalid provider entry: identifier=%r upstream_url=%r",
+                identifier,
+                upstream_url,
+            )
+            sys.exit(1)
+        if identifier in seen_identifiers:
+            LOGGER.error("Duplicate provider identifier: %r", identifier)
+            sys.exit(1)
+        seen_identifiers.add(identifier)
+        PROVIDERS[identifier] = Provider(
+            identifier=identifier,
+            upstream_url=upstream_url,
+            models=models,
+        )
+    LOGGER.info(
+        "Model proxy configured with %d provider(s): %s",
+        len(PROVIDERS),
+        ", ".join(PROVIDERS),
+    )
 
     mcp_cfg = cfg.get("mcp")
     if mcp_cfg and mcp_cfg.get("upstream_url") and mcp_cfg.get("api_key"):

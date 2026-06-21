@@ -2,14 +2,19 @@
 listen_host: "0.0.0.0"
 listen_port: 8080
 
-# model_mappings: what the client sends (key) -> what the provider expects (value)
-# Models not listed here pass through unchanged.
-model_mappings:
-  upstream_url: "https://open.bigmodel.cn/api/anthropic"
-  models:
-    claude-haiku-4-5: "glm-4.5-air"
-    claude-sonnet-4-6: "glm-5"
-    claude-opus-4-7: "glm-5.1"
+# providers: multi-provider routing configuration.
+# Each provider has an identifier. Clients must prefix their real API key
+# with the identifier in brackets, e.g.:
+#   Authorization: Bearer [glm]your-real-zhipu-key
+# The proxy uses the identifier to select the provider, strips the prefix,
+# and forwards the real key to the provider's upstream_url.
+providers:
+  - identifier: "glm"
+    upstream_url: "https://open.bigmodel.cn/api/anthropic"
+    models:
+      claude-haiku-4-5: "glm-4.5-air"
+      claude-sonnet-4-6: "glm-5"
+      claude-opus-4-7: "glm-5.1"
 
 # MCP reverse proxy: intercepts HTTP requests from MCP servers (e.g. @z_ai/mcp-server)
 # and injects authentication headers before forwarding to the real API.

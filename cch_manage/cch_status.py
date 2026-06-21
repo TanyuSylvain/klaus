@@ -267,10 +267,9 @@ class CchStatusFeature:
                 media_type=content_type or None,
             )
 
-        generated_at = await self._get_status_page_public_status_generated_at()
         html = self._rewrite_root_relative_urls(upstream.text)
         return HTMLResponse(
-            self._inject_status_script(html, generated_at),
+            self._inject_status_script(html),
             headers={"cache-control": "no-store"},
         )
 
@@ -412,17 +411,6 @@ class CchStatusFeature:
         data = await self._get_public_status_payload("include=groups")
         groups = data.get("groups") if isinstance(data, dict) else None
         return [group for group in groups if isinstance(group, dict)] if isinstance(groups, list) else []
-
-    async def _get_status_page_public_status_generated_at(self) -> str | None:
-        try:
-            payload = await self._get_public_status_payload(
-                urlencode({"groupSlug": self.config.status_group_slug, "include": "defaults"})
-            )
-        except Exception:
-            LOGGER.exception("failed to fetch CCH public status generatedAt for status page")
-            return None
-        generated_at = payload.get("generatedAt")
-        return generated_at if isinstance(generated_at, str) else None
 
     async def _get_cached_public_status(self, query: str) -> tuple[dict[str, Any], int, float]:
         now_monotonic = time.monotonic()
@@ -665,14 +653,12 @@ class CchStatusFeature:
             raise RuntimeError(f"CCH action failed: {body.get('error', 'unknown error')}")
         return body.get("data")
 
-    def _inject_status_script(self, html: str, public_status_generated_at: str | None = None) -> str:
+    def _inject_status_script(self, html: str) -> str:
         script = f"""
 <script>
 (() => {{
   const statusGroupSlug = {json.dumps(self.config.status_group_slug)};
   const refreshMs = {max(1, self.config.cache_ttl_seconds) * 1000};
-  const publicStatusGeneratedAt = {json.dumps(public_status_generated_at)};
-  const publicStatusEndpoint = window.location.origin + "/api/public-status?include=defaults&groupSlug=" + encodeURIComponent(statusGroupSlug);
   const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
   const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
   const priceCoefficientsEndpoint = window.location.origin + "/cch/status/group-price-coefficients";
@@ -875,63 +861,10 @@ class CchStatusFeature:
       .then((body) => body && body.ok && scheduleRenderPriceCoefficients(body.data))
       .catch(() => {{}});
   }};
-  const restoreScrollAfterReload = () => {{
-    try {{
-      const value = window.sessionStorage.getItem("llm-proxy-cch-scroll-y");
-      if (!value) return;
-      window.sessionStorage.removeItem("llm-proxy-cch-scroll-y");
-      const y = Number(value);
-      if (Number.isFinite(y)) window.setTimeout(() => window.scrollTo(0, y), 0);
-    }} catch (_) {{}}
-  }};
-  let latestPublicStatusGeneratedAt = publicStatusGeneratedAt || null;
-  let reloadingForPublicStatus = false;
-  let publicStatusReloadTimer = null;
-  const publicStatusPollDelayMs = (response) => {{
-    const rawSeconds = Number(response.headers.get("x-llm-proxy-cch-cache-expires-in-seconds"));
-    const seconds = Number.isFinite(rawSeconds) && rawSeconds > 0 ? rawSeconds : refreshMs / 1000;
-    return Math.max(1000, seconds * 1000) + Math.floor(Math.random() * 5000);
-  }};
-  const schedulePublicStatusReloadCheck = (delayMs) => {{
-    if (publicStatusReloadTimer !== null) window.clearTimeout(publicStatusReloadTimer);
-    publicStatusReloadTimer = window.setTimeout(reloadWhenPublicStatusChanges, delayMs);
-  }};
-  const reloadWhenPublicStatusChanges = () => {{
-    if (reloadingForPublicStatus) return;
-    let nextDelayMs = refreshMs;
-    fetch(publicStatusEndpoint, {{ cache: "no-store" }})
-      .then((response) => {{
-        if (response.status !== 200 && response.status !== 503) {{
-          throw new Error("public status unavailable");
-        }}
-        nextDelayMs = publicStatusPollDelayMs(response);
-        return response.json();
-      }})
-      .then((data) => {{
-        const nextGeneratedAt = data && typeof data.generatedAt === "string" ? data.generatedAt : "";
-        if (!nextGeneratedAt) return;
-        if (!latestPublicStatusGeneratedAt) {{
-          latestPublicStatusGeneratedAt = nextGeneratedAt;
-          return;
-        }}
-        if (nextGeneratedAt === latestPublicStatusGeneratedAt) return;
-        reloadingForPublicStatus = true;
-        try {{
-          window.sessionStorage.setItem("llm-proxy-cch-scroll-y", String(window.scrollY || 0));
-        }} catch (_) {{}}
-        window.location.reload();
-      }})
-      .catch(() => {{}})
-      .finally(() => {{
-        if (!reloadingForPublicStatus) schedulePublicStatusReloadCheck(nextDelayMs);
-      }});
-  }};
   const startEnhancements = () => {{
-    restoreScrollAfterReload();
     loadConsumption();
     loadLeaderboard();
     loadPriceCoefficients();
-    reloadWhenPublicStatusChanges();
     window.setInterval(loadConsumption, refreshMs);
     window.setInterval(loadLeaderboard, refreshMs);
     window.setInterval(loadPriceCoefficients, refreshMs);

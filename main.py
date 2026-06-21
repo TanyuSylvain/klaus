@@ -12,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
 
-from cch_manage.cch_status import CchStatusConfig, CchStatusFeature
+from cch_manage import CchStatusConfig, CchStatusFeature
 
 HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "transfer-encoding", "te", "trailers",

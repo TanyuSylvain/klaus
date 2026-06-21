@@ -173,5 +173,19 @@ def active_leaderboard_entries(entries: list[dict[str, Any]]) -> list[dict[str, 
     ]
 
 
+def weekly_total_used_usd(entries: list[dict[str, Any]]) -> float:
+    total = Decimal("0")
+    for entry in entries:
+        total += decimal_from_any(entry.get("usedUsd"))
+    return money_float(total) or 0.0
+
+
+def weekly_total_requests(entries: list[dict[str, Any]]) -> int:
+    total = 0
+    for entry in entries:
+        total += int_from_any(entry.get("requestCount"))
+    return total
+
+
 def api_key_hash(api_key: str) -> str:
     return sha256(api_key.encode("utf-8")).hexdigest()

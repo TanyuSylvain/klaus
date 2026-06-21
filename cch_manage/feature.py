@@ -19,6 +19,8 @@ from cch_manage.leaderboard import (
     api_key_hash,
     get_weekly_leaderboard as build_weekly_leaderboard,
     public_leaderboard_entry,
+    weekly_total_requests,
+    weekly_total_used_usd,
 )
 from cch_manage.price_coefficients import extract_group_price_coefficients
 from cch_manage.quota import manage_provider_group_quota
@@ -312,6 +314,8 @@ class CchStatusFeature:
                 public_leaderboard_entry(entry)
                 for entry in active_leaderboard_entries(leaderboard)[:3]
             ],
+            "weeklyTotalRequests": weekly_total_requests(leaderboard),
+            "weeklyTotalUsedUsd": weekly_total_used_usd(leaderboard),
             "userUsage": leaderboard,
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }

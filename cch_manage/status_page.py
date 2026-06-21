@@ -134,7 +134,13 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
       rangeEndDate.setDate(rangeEndDate.getDate() - 1);
     }}
     const rangeEnd = dateLabel(rangeEndDate);
-    const rangeNote = rangeStart && rangeEnd ? `（${{rangeStart}}-${{rangeEnd}}）` : "";
+    const totalCostNote = typeof data.weeklyTotalUsedUsd === "number"
+      ? `, 总消费：${{money(data.weeklyTotalUsedUsd)}}`
+      : "";
+    const totalRequestsNote = typeof data.weeklyTotalRequests === "number"
+      ? `, 总请求：${{compactNumber(data.weeklyTotalRequests)}}`
+      : "";
+    const rangeNote = rangeStart && rangeEnd ? `（${{rangeStart}}-${{rangeEnd}}${{totalCostNote}}${{totalRequestsNote}}）` : "";
     board.innerHTML = `
       <div style="margin-bottom:10px;font-size:14px;font-weight:600;color:var(--foreground);">本周消费排行榜${{rangeNote}}</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">${{cards}}</div>

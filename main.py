@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -6,6 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import httpx
 import uvicorn
@@ -133,6 +135,36 @@ def _should_rewrite_anthropic_response(
     )
 
 
+async def _rewrite_model_in_body(
+    raw_body: bytes,
+    provider: Provider,
+) -> tuple[bytes, str | None, str | None]:
+    """Parse a JSON request body and rewrite the model name off the event loop.
+
+    Returns the (possibly rewritten) body plus the original and rewritten model
+    names when a model field was present.
+    """
+
+    def _sync() -> tuple[bytes, str | None, str | None]:
+        try:
+            data = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError):
+            return raw_body, None, None
+
+        if isinstance(data, dict) and "model" in data:
+            original_model = data["model"]
+            rewritten_model = provider.models.get(original_model, original_model)
+            if original_model != rewritten_model:
+                data["model"] = rewritten_model
+                return json.dumps(data).encode(), original_model, rewritten_model
+            return raw_body, original_model, original_model
+
+        return raw_body, None, None
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _sync)
+
+
 def _sanitize_rewritten_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
         k: v for k, v in headers.items()
@@ -164,6 +196,16 @@ def _take_complete_line(buf: str) -> tuple[str, str] | None:
                 return buf[:idx], buf[idx + 2:]
             return buf[:idx], buf[idx + 1:]
     return None
+
+
+def _needs_anthropic_sse_rewrite(event_lines: list[str]) -> bool:
+    """Cheap pre-check: does this event look like a message_start event?"""
+    for line in event_lines:
+        if line.startswith("data:") and (
+            '"type":"message_start"' in line or '"type": "message_start"' in line
+        ):
+            return True
+    return False
 
 
 def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) -> str:
@@ -217,6 +259,17 @@ def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) ->
     return "\n".join(rebuilt) + "\n\n"
 
 
+async def _rewrite_anthropic_sse_event_async(
+    event_lines: list[str],
+    original_model: str,
+) -> str:
+    """Rewrite an SSE event off the main event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _rewrite_anthropic_sse_event, event_lines, original_model
+    )
+
+
 async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
     line_buf = ""
     event_lines: list[str] = []
@@ -230,7 +283,13 @@ async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
             line, line_buf = parsed
             if line == "":
                 if event_lines:
-                    yield _rewrite_anthropic_sse_event(event_lines, original_model).encode("utf-8")
+                    if _needs_anthropic_sse_rewrite(event_lines):
+                        rewritten = await _rewrite_anthropic_sse_event_async(
+                            event_lines, original_model
+                        )
+                        yield rewritten.encode("utf-8")
+                    else:
+                        yield "\n".join(event_lines).encode("utf-8") + b"\n\n"
                     event_lines.clear()
                 else:
                     yield b"\n"
@@ -240,7 +299,13 @@ async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
     if line_buf:
         event_lines.append(line_buf)
     if event_lines:
-        yield _rewrite_anthropic_sse_event(event_lines, original_model).encode("utf-8")
+        if _needs_anthropic_sse_rewrite(event_lines):
+            rewritten = await _rewrite_anthropic_sse_event_async(
+                event_lines, original_model
+            )
+            yield rewritten.encode("utf-8")
+        else:
+            yield "\n".join(event_lines).encode("utf-8") + b"\n\n"
 
 
 async def _rewrite_anthropic_response(upstream_response, original_model: str):
@@ -268,22 +333,16 @@ async def proxy(request: Request) -> StreamingResponse:
 
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type and raw_body:
-        try:
-            data = json.loads(raw_body)
-            if isinstance(data, dict) and "model" in data:
-                original_model = data["model"]
-                rewritten_model = provider.models.get(original_model, original_model)
-                LOGGER.info(
-                    "model rewrite check path=%s inbound_model=%r outbound_model=%r",
-                    request.url.path,
-                    original_model,
-                    rewritten_model,
-                )
-                if original_model != rewritten_model:
-                    data["model"] = rewritten_model
-                    raw_body = json.dumps(data).encode()
-        except (json.JSONDecodeError, ValueError):
-            pass
+        raw_body, original_model, rewritten_model = await _rewrite_model_in_body(
+            raw_body, provider
+        )
+        if original_model is not None:
+            LOGGER.info(
+                "model rewrite check path=%s inbound_model=%r outbound_model=%r",
+                request.url.path,
+                original_model,
+                rewritten_model,
+            )
 
     upstream_headers = {
         k: v for k, v in request.headers.items()
@@ -506,16 +565,38 @@ def build_routes(cch_status_feature: CchStatusFeature | None = None) -> list:
     return routes
 
 
-def make_lifespan(cch_status_feature: CchStatusFeature | None = None):
+def _build_client_kwargs(proxy_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build httpx.AsyncClient kwargs from the optional proxy config section.
+
+    Defaults match the original hardcoded values so existing configs keep the
+    same behaviour.
+    """
+    proxy_cfg = proxy_cfg or {}
+
+    return dict(
+        http2=True,
+        follow_redirects=False,
+        limits=httpx.Limits(
+            max_connections=int(proxy_cfg.get("max_connections", 200)),
+            max_keepalive_connections=int(proxy_cfg.get("max_keepalive_connections", 50)),
+            keepalive_expiry=float(proxy_cfg.get("keepalive_expiry", 5.0)),
+        ),
+        timeout=httpx.Timeout(
+            connect=10.0,
+            read=300.0,
+            write=30.0,
+            pool=float(proxy_cfg.get("pool_timeout", 5.0)),
+        ),
+    )
+
+
+def make_lifespan(
+    client_kwargs: dict[str, Any],
+    cch_status_feature: CchStatusFeature | None = None,
+):
     async def lifespan(_app: Starlette):
         global MODEL_CLIENT, MCP_CLIENT, IMAGE_CLIENT
 
-        client_kwargs = dict(
-            http2=True,
-            follow_redirects=False,
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
-            timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=5.0),
-        )
         MODEL_CLIENT = httpx.AsyncClient(**client_kwargs)
         if MCP_ENABLED:
             MCP_CLIENT = httpx.AsyncClient(**client_kwargs)
@@ -617,7 +698,10 @@ def main():
 
     app = Starlette(
         routes=build_routes(cch_status_feature),
-        lifespan=make_lifespan(cch_status_feature),
+        lifespan=make_lifespan(
+            _build_client_kwargs(cfg.get("proxy")),
+            cch_status_feature,
+        ),
     )
 
     uvicorn.run(

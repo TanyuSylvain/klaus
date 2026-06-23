@@ -24,6 +24,15 @@ providers:
 #   upstream_url: "https://open.bigmodel.cn/api/paas/v4"
 #   api_key: "your-zhipu-api-key-here"
 
+# Optional HTTP client tuning for the model/MCP/image upstream clients.
+# These values mirror the original hardcoded defaults; raise them if you need
+# higher concurrency and the host has enough file descriptors / memory.
+# proxy:
+#   pool_timeout: 5.0
+#   keepalive_expiry: 5.0
+#   max_connections: 200
+#   max_keepalive_connections: 50
+
 # CCH public status page wrapper.
 # When enabled, llm-proxy serves:
 #   GET /cch/status

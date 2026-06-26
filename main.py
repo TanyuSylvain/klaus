@@ -32,6 +32,13 @@ cfg: dict = {}
 
 _PROVIDER_PREFIX_RE = re.compile(r"^\[([a-zA-Z0-9_-]+)\]")
 
+PRETEND_IDENTITY_TEMPLATE = (
+    "You are {model}. If you are asked which model, AI, or assistant you are, "
+    "or who created, built, or trained you, you must identify yourself only as "
+    "\"{model}\". Never reveal, mention, or hint at any other underlying or "
+    "base model name under any circumstances."
+)
+
 
 @dataclass
 class Provider:
@@ -149,14 +156,34 @@ def _response_rewrite_kind(
     return None
 
 
+def _inject_responses_identity(data: dict, original_model: str) -> None:
+    """Force an OpenAI /v1/responses body to claim the requested model identity.
+
+    The upstream model reports its real name when asked who it is, which
+    contradicts the rewritten model name the client sees in the response. We
+    prepend a directive to the top-level ``instructions`` field (the Responses
+    API system prompt) so the model pretends to be the originally requested
+    model instead.
+    """
+    directive = PRETEND_IDENTITY_TEMPLATE.format(model=original_model)
+    existing = data.get("instructions")
+    if isinstance(existing, str) and existing:
+        data["instructions"] = directive + "\n\n" + existing
+    else:
+        data["instructions"] = directive
+
+
 async def _rewrite_model_in_body(
     raw_body: bytes,
     provider: Provider,
+    request_path: str,
 ) -> tuple[bytes, str | None, str | None]:
     """Parse a JSON request body and rewrite the model name off the event loop.
 
     Returns the (possibly rewritten) body plus the original and rewritten model
-    names when a model field was present.
+    names when a model field was present. When the model is rewritten on the
+    OpenAI /v1/responses endpoint, a pretend-identity directive is also injected
+    so the upstream model claims the requested name.
     """
 
     def _sync() -> tuple[bytes, str | None, str | None]:
@@ -170,6 +197,8 @@ async def _rewrite_model_in_body(
             rewritten_model = provider.models.get(original_model, original_model)
             if original_model != rewritten_model:
                 data["model"] = rewritten_model
+                if _is_openai_responses_path(request_path):
+                    _inject_responses_identity(data, original_model)
                 return json.dumps(data).encode(), original_model, rewritten_model
             return raw_body, original_model, original_model
 
@@ -427,7 +456,7 @@ async def proxy(request: Request) -> StreamingResponse:
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type and raw_body:
         raw_body, original_model, rewritten_model = await _rewrite_model_in_body(
-            raw_body, provider
+            raw_body, provider, request.url.path
         )
         if original_model is not None:
             LOGGER.info(

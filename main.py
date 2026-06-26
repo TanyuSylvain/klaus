@@ -5,6 +5,7 @@ import re
 import sqlite3
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -123,16 +124,29 @@ def _is_anthropic_messages_path(path: str) -> bool:
     return path == "/v1/messages"
 
 
-def _should_rewrite_anthropic_response(
+def _is_openai_responses_path(path: str) -> bool:
+    return path == "/v1/responses"
+
+
+def _response_rewrite_kind(
     request_path: str,
     original_model: str | None,
     rewritten_model: str | None,
-) -> bool:
-    return (
-        _is_anthropic_messages_path(request_path)
-        and original_model is not None
-        and original_model != rewritten_model
-    )
+) -> str | None:
+    """Return which response-model rewrite to apply, or None.
+
+    The upstream returns its own model name, so when a request model was
+    rewritten we rewrite the model back to the originally requested name in the
+    response too. "anthropic" handles /v1/messages, "openai-responses" handles
+    the OpenAI /v1/responses endpoint.
+    """
+    if original_model is None or original_model == rewritten_model:
+        return None
+    if _is_anthropic_messages_path(request_path):
+        return "anthropic"
+    if _is_openai_responses_path(request_path):
+        return "openai-responses"
+    return None
 
 
 async def _rewrite_model_in_body(
@@ -185,6 +199,19 @@ def _rewrite_anthropic_json_body(body: bytes, original_model: str) -> bytes:
     return body
 
 
+def _rewrite_openai_json_body(body: bytes, original_model: str) -> bytes:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+
+    if isinstance(payload, dict) and "model" in payload:
+        payload["model"] = original_model
+        return json.dumps(payload).encode("utf-8")
+
+    return body
+
+
 def _take_complete_line(buf: str) -> tuple[str, str] | None:
     for idx, ch in enumerate(buf):
         if ch == "\n":
@@ -208,7 +235,24 @@ def _needs_anthropic_sse_rewrite(event_lines: list[str]) -> bool:
     return False
 
 
-def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) -> str:
+def _needs_openai_sse_rewrite(event_lines: list[str]) -> bool:
+    """Cheap pre-check: does this event carry a model field worth rewriting?"""
+    for line in event_lines:
+        if line.startswith("data:") and '"model"' in line:
+            return True
+    return False
+
+
+def _rewrite_sse_event(
+    event_lines: list[str],
+    mutate: Callable[[dict], bool],
+) -> str:
+    """Parse an SSE event's data payload, apply ``mutate``, and rebuild it.
+
+    ``mutate`` receives the decoded JSON dict and returns True if it modified
+    the payload in place. When the event has no JSON data or ``mutate`` makes no
+    change, the original event lines are returned untouched.
+    """
     data_values: list[str] = []
     first_data_index: int | None = None
 
@@ -234,14 +278,7 @@ def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) ->
     except json.JSONDecodeError:
         return "\n".join(event_lines) + "\n\n"
 
-    if (
-        isinstance(payload, dict)
-        and payload.get("type") == "message_start"
-        and isinstance(payload.get("message"), dict)
-        and "model" in payload["message"]
-    ):
-        payload["message"]["model"] = original_model
-    else:
+    if not (isinstance(payload, dict) and mutate(payload)):
         return "\n".join(event_lines) + "\n\n"
 
     rebuilt: list[str] = []
@@ -259,18 +296,53 @@ def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) ->
     return "\n".join(rebuilt) + "\n\n"
 
 
-async def _rewrite_anthropic_sse_event_async(
+def _rewrite_anthropic_sse_event(event_lines: list[str], original_model: str) -> str:
+    def mutate(payload: dict) -> bool:
+        if (
+            payload.get("type") == "message_start"
+            and isinstance(payload.get("message"), dict)
+            and "model" in payload["message"]
+        ):
+            payload["message"]["model"] = original_model
+            return True
+        return False
+
+    return _rewrite_sse_event(event_lines, mutate)
+
+
+def _rewrite_openai_sse_event(event_lines: list[str], original_model: str) -> str:
+    def mutate(payload: dict) -> bool:
+        changed = False
+        envelope = payload.get("response")
+        if isinstance(envelope, dict) and "model" in envelope:
+            envelope["model"] = original_model
+            changed = True
+        if "model" in payload:
+            payload["model"] = original_model
+            changed = True
+        return changed
+
+    return _rewrite_sse_event(event_lines, mutate)
+
+
+async def _rewrite_sse_event_async(
+    event_fn: Callable[[list[str], str], str],
     event_lines: list[str],
     original_model: str,
 ) -> str:
     """Rewrite an SSE event off the main event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, _rewrite_anthropic_sse_event, event_lines, original_model
+        None, event_fn, event_lines, original_model
     )
 
 
-async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
+async def _rewrite_sse_stream(
+    upstream_response,
+    original_model: str,
+    needs_fn: Callable[[list[str]], bool],
+    event_fn: Callable[[list[str], str], str],
+):
     line_buf = ""
     event_lines: list[str] = []
 
@@ -283,9 +355,9 @@ async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
             line, line_buf = parsed
             if line == "":
                 if event_lines:
-                    if _needs_anthropic_sse_rewrite(event_lines):
-                        rewritten = await _rewrite_anthropic_sse_event_async(
-                            event_lines, original_model
+                    if needs_fn(event_lines):
+                        rewritten = await _rewrite_sse_event_async(
+                            event_fn, event_lines, original_model
                         )
                         yield rewritten.encode("utf-8")
                     else:
@@ -299,9 +371,9 @@ async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
     if line_buf:
         event_lines.append(line_buf)
     if event_lines:
-        if _needs_anthropic_sse_rewrite(event_lines):
-            rewritten = await _rewrite_anthropic_sse_event_async(
-                event_lines, original_model
+        if needs_fn(event_lines):
+            rewritten = await _rewrite_sse_event_async(
+                event_fn, event_lines, original_model
             )
             yield rewritten.encode("utf-8")
         else:
@@ -311,12 +383,33 @@ async def _rewrite_anthropic_sse_stream(upstream_response, original_model: str):
 async def _rewrite_anthropic_response(upstream_response, original_model: str):
     content_type = upstream_response.headers.get("content-type", "")
     if "text/event-stream" in content_type:
-        async for chunk in _rewrite_anthropic_sse_stream(upstream_response, original_model):
+        async for chunk in _rewrite_sse_stream(
+            upstream_response,
+            original_model,
+            _needs_anthropic_sse_rewrite,
+            _rewrite_anthropic_sse_event,
+        ):
             yield chunk
         return
 
     body = await upstream_response.aread()
     yield _rewrite_anthropic_json_body(body, original_model)
+
+
+async def _rewrite_openai_response(upstream_response, original_model: str):
+    content_type = upstream_response.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        async for chunk in _rewrite_sse_stream(
+            upstream_response,
+            original_model,
+            _needs_openai_sse_rewrite,
+            _rewrite_openai_sse_event,
+        ):
+            yield chunk
+        return
+
+    body = await upstream_response.aread()
+    yield _rewrite_openai_json_body(body, original_model)
 
 
 async def proxy(request: Request) -> StreamingResponse:
@@ -355,7 +448,10 @@ async def proxy(request: Request) -> StreamingResponse:
     _, real_key = _split_auth_token(token)
     upstream_headers["authorization"] = f"Bearer {real_key}"
 
-    if _should_rewrite_anthropic_response(request.url.path, original_model, rewritten_model):
+    rewrite_kind = _response_rewrite_kind(
+        request.url.path, original_model, rewritten_model
+    )
+    if rewrite_kind is not None:
         upstream_headers["accept-encoding"] = "identity"
 
     target = provider.upstream_url + request.url.path
@@ -378,12 +474,21 @@ async def proxy(request: Request) -> StreamingResponse:
         if k.lower() not in HOP_BY_HOP
     }
 
-    if _should_rewrite_anthropic_response(request.url.path, original_model, rewritten_model):
+    if rewrite_kind == "anthropic":
         resp_headers = _sanitize_rewritten_headers(resp_headers)
 
         async def generate():
             try:
                 async for chunk in _rewrite_anthropic_response(upstream_response, original_model):
+                    yield chunk
+            finally:
+                await upstream_response.aclose()
+    elif rewrite_kind == "openai-responses":
+        resp_headers = _sanitize_rewritten_headers(resp_headers)
+
+        async def generate():
+            try:
+                async for chunk in _rewrite_openai_response(upstream_response, original_model):
                     yield chunk
             finally:
                 await upstream_response.aclose()

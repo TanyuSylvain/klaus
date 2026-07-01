@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -32,6 +32,11 @@ cfg: dict = {}
 
 _PROVIDER_PREFIX_RE = re.compile(r"^\[([a-zA-Z0-9_-]+)\]")
 
+# Characters commonly found in concrete model IDs. Keys in ``models`` that
+# contain anything outside this set are treated as regex patterns and are not
+# advertised in /v1/models.
+_MODEL_ID_LITERAL_RE = re.compile(r"^[a-zA-Z0-9._:-]+$")
+
 PRETEND_IDENTITY_TEMPLATE = (
     "You are {model}. If you are asked which model, AI, or assistant you are, "
     "or who created, built, or trained you, you must identify yourself only as "
@@ -45,6 +50,7 @@ class Provider:
     identifier: str
     upstream_url: str
     models: dict[str, str]
+    model_patterns: list[tuple[re.Pattern[str], str]] = field(default_factory=list)
 
 
 PROVIDERS: dict[str, Provider] = {}
@@ -85,6 +91,11 @@ def log_image_request(api_key: str, elapsed_ms: float):
 
 
 def models_payload(provider: Provider) -> dict:
+    advertised = [
+        model_name
+        for model_name in provider.models
+        if _MODEL_ID_LITERAL_RE.match(model_name)
+    ]
     return {
         "data": [
             {
@@ -93,7 +104,7 @@ def models_payload(provider: Provider) -> dict:
                 "display_name": model_name,
                 "created_at": "2025-01-01T00:00:00Z",
             }
-            for model_name in provider.models
+            for model_name in advertised
         ],
         "has_more": False,
     }
@@ -173,6 +184,21 @@ def _inject_responses_identity(data: dict, original_model: str) -> None:
         data["instructions"] = directive
 
 
+def _resolve_model(provider: Provider, model_id: str) -> str:
+    """Return the upstream model name for a requested model ID.
+
+    Exact entries in ``provider.models`` take priority over regex patterns.
+    Patterns are matched with implicit ``^...$`` anchoring. If nothing matches,
+    ``model_id`` is returned unchanged.
+    """
+    if model_id in provider.models:
+        return provider.models[model_id]
+    for pattern, target in provider.model_patterns:
+        if pattern.fullmatch(model_id):
+            return target
+    return model_id
+
+
 async def _rewrite_model_in_body(
     raw_body: bytes,
     provider: Provider,
@@ -194,7 +220,7 @@ async def _rewrite_model_in_body(
 
         if isinstance(data, dict) and "model" in data:
             original_model = data["model"]
-            rewritten_model = provider.models.get(original_model, original_model)
+            rewritten_model = _resolve_model(provider, original_model)
             if original_model != rewritten_model:
                 data["model"] = rewritten_model
                 if _is_openai_responses_path(request_path):
@@ -777,6 +803,24 @@ def main():
         identifier = entry.get("identifier")
         upstream_url = entry.get("upstream_url", "").rstrip("/")
         models = entry.get("models", {})
+        if not isinstance(models, dict):
+            LOGGER.error(
+                "Invalid 'models' for provider %r: expected a mapping", identifier
+            )
+            sys.exit(1)
+        model_patterns: list[tuple[re.Pattern[str], str]] = []
+        for pattern_str, target in models.items():
+            try:
+                compiled = re.compile(f"^(?:{pattern_str})$")
+            except re.error as exc:
+                LOGGER.error(
+                    "Invalid regex pattern for provider %r model %r: %s",
+                    identifier,
+                    pattern_str,
+                    exc,
+                )
+                sys.exit(1)
+            model_patterns.append((compiled, target))
         if not identifier or not upstream_url:
             LOGGER.error(
                 "Invalid provider entry: identifier=%r upstream_url=%r",
@@ -792,6 +836,7 @@ def main():
             identifier=identifier,
             upstream_url=upstream_url,
             models=models,
+            model_patterns=model_patterns,
         )
     LOGGER.info(
         "Model proxy configured with %d provider(s): %s",

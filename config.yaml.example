@@ -12,9 +12,15 @@ providers:
   - identifier: "glm"
     upstream_url: "https://open.bigmodel.cn/api/anthropic"
     models:
+      # Exact mappings still work as before and are advertised in /v1/models.
       claude-haiku-4-5: "glm-4.5-air"
       claude-sonnet-4-6: "glm-5"
       claude-opus-4-7: "glm-5.1"
+      # Regex patterns (auto-anchored to the whole model ID) can cover dated
+      # variants. Use real Python regex syntax: "claude-haiku.*" matches
+      # claude-haiku-4-5-20251001, etc. Patterns are not advertised in
+      # /v1/models and exact entries take priority over patterns.
+      claude-haiku.*: "glm-4.5-air"
 
 # MCP reverse proxy: intercepts HTTP requests from MCP servers (e.g. @z_ai/mcp-server)
 # and injects authentication headers before forwarding to the real API.

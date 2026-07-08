@@ -25,7 +25,23 @@ def build_routes(
 ) -> list:
     routes = list(llm_proxy_feature.routes())
     if cch_status_feature is not None:
-        routes.extend(cch_status_feature.routes())
+        # The LLM proxy registers a catch-all /{path:path} route as its last
+        # route. CCH public status routes must be matched before it, otherwise
+        # unauthenticated status page requests are rejected with 401.
+        catch_all_index = next(
+            (
+                i
+                for i, route in enumerate(routes)
+                if getattr(route, "path", None) == "/{path:path}"
+            ),
+            None,
+        )
+        if catch_all_index is not None:
+            catch_all = routes.pop(catch_all_index)
+            routes.extend(cch_status_feature.routes())
+            routes.append(catch_all)
+        else:
+            routes.extend(cch_status_feature.routes())
     return routes
 
 

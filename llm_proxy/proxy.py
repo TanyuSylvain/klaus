@@ -111,6 +111,11 @@ async def handle_proxy_request(
     _, real_key = split_auth_token(token)
     upstream_headers["authorization"] = f"Bearer {real_key}"
 
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key:
+        _, real_x_api_key = split_auth_token(x_api_key)
+        upstream_headers["x-api-key"] = real_x_api_key
+
     rewrite_kind = response_rewrite_kind(
         request.url.path, original_model, rewritten_model
     )
@@ -127,6 +132,7 @@ async def handle_proxy_request(
         headers=upstream_headers,
         content=raw_body,
     )
+
     try:
         upstream_response = await model_client.send(req, stream=True)
     except httpx.RemoteProtocolError:

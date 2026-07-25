@@ -66,3 +66,32 @@ providers:
 #     opus: ["claude"]
 #   auto_manage_provider_group_quota: false
 #   auto_disable_threshold_pct: 100
+#   # Real-provider coding-plan usage (Kimi / GLM / MiniMax only).
+#   # Queries 5h + weekly utilization from the vendor API (not CCH), displays
+#   # badges on status groups mapped via status_group_provider_groups, and
+#   # disables/enables all CCH providers in provider_group at 100% / reset.
+#   # base_url is optional: defaults are
+#   #   kimi    -> https://api.kimi.com/coding
+#   #   glm     -> https://open.bigmodel.cn
+#   #   minimax -> https://api.minimaxi.com
+#   # Override base_url only for regional variants (api.z.ai, api.minimax.io, …).
+#   # For kimi the base_url must include the /coding prefix; it is appended if missing.
+#   # At most one monitor per provider_group.
+#   usage_monitors:
+#     - provider_group: claude
+#       provider: glm
+#       api_key: "your-glm-coding-plan-key"
+#     - provider_group: minimax
+#       provider: minimax
+#       api_key: "your-minimax-key"
+#     - provider_group: kimi
+#       provider: kimi
+#       api_key: "your-kimi-key"
+#   usage_query:
+#     base_interval_seconds: 300        # poll when usage < 90%
+#     min_interval_seconds: 30          # poll at 100%
+#     high_usage_threshold_pct: 90
+#     disable_threshold_pct: 100
+#     request_timeout_seconds: 15
+#     state_path: "data/cch_usage_state.json"
+

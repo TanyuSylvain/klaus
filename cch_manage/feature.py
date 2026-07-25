@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from asyncio import Lock
@@ -23,6 +24,7 @@ from cch_manage.leaderboard import (
     weekly_total_used_usd,
 )
 from cch_manage.price_coefficients import extract_group_price_coefficients
+from cch_manage.provider_usage import ProviderUsageManager
 from cch_manage.quota import manage_provider_group_quota
 from cch_manage.status_page import inject_status_script, rewrite_root_relative_urls
 from cch_manage.utils import (
@@ -57,6 +59,14 @@ class CchStatusFeature:
         self._public_status_cache: dict[str, _PublicStatusCacheEntry] = {}
         self._public_status_lock = Lock()
         self._auto_disabled_provider_ids: set[int] = set()
+        self._usage_manager: ProviderUsageManager | None = None
+        self._usage_task: asyncio.Task[None] | None = None
+        if config.usage_monitors:
+            self._usage_manager = ProviderUsageManager(
+                config.usage_monitors,
+                config.usage_query,
+                status_group_provider_groups=config.status_group_provider_groups,
+            )
 
     def routes(self) -> list[Route]:
         return [
@@ -69,10 +79,20 @@ class CchStatusFeature:
             Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
             Route("/cch/status/weekly-user-consumption", self.weekly_user_consumption, methods=["GET"]),
             Route("/cch/status/group-price-coefficients", self.group_price_coefficients, methods=["GET"]),
+            Route("/cch/status/provider-usage", self.provider_usage, methods=["GET"]),
         ]
 
     async def start(self, client_kwargs: dict[str, Any]) -> None:
         self.client = httpx.AsyncClient(**client_kwargs)
+        if self._usage_manager is not None:
+            self._usage_task = asyncio.create_task(
+                self._usage_monitor_loop(),
+                name="cch-provider-usage-monitor",
+            )
+            LOGGER.info(
+                "CCH provider usage monitors started count=%s",
+                len(self.config.usage_monitors),
+            )
 
     async def warmup(self) -> None:
         if not self.config.weekly_leaderboard_enabled:
@@ -95,6 +115,13 @@ class CchStatusFeature:
         )
 
     async def aclose(self) -> None:
+        if self._usage_task is not None:
+            self._usage_task.cancel()
+            try:
+                await self._usage_task
+            except asyncio.CancelledError:
+                pass
+            self._usage_task = None
         if self.client is not None:
             await self.client.aclose()
 
@@ -155,6 +182,16 @@ class CchStatusFeature:
                 status_code=502,
             )
         return JSONResponse({"ok": True, "data": payload})
+
+    async def provider_usage(self, _: Request) -> JSONResponse:
+        if self._usage_manager is None:
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "data": {"groups": []},
+                }
+            )
+        return JSONResponse({"ok": True, "data": self._usage_manager.public_payload()})
 
     async def public_status(self, request: Request) -> JSONResponse:
         try:
@@ -480,6 +517,35 @@ class CchStatusFeature:
             )
             return False
         return True
+
+    async def _get_group_providers(self, provider_group: str) -> list[dict[str, Any]]:
+        _, group_providers = await cch_client.get_claude_group_providers(
+            self._post_action,
+            provider_group,
+        )
+        return group_providers
+
+    async def _usage_monitor_loop(self) -> None:
+        assert self._usage_manager is not None
+        # Small initial delay so the HTTP client is fully ready.
+        await asyncio.sleep(1)
+        while True:
+            delay = 1.0
+            try:
+                client = self._require_client()
+                await self._usage_manager.poll_due(
+                    client,
+                    get_group_providers=self._get_group_providers,
+                    set_provider_enabled=self._set_provider_enabled,
+                )
+                delay = self._usage_manager.seconds_until_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("provider usage monitor loop iteration failed")
+            # Cap the sleep so cancellation stays responsive and a clock-skewed
+            # deadline cannot park the loop indefinitely.
+            await asyncio.sleep(min(max(delay, 1.0), 60.0))
 
     async def _post_action(self, path: str, payload: dict[str, Any]) -> Any:
         return await cch_client.post_action(

@@ -15,6 +15,7 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
   const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
   const priceCoefficientsEndpoint = window.location.origin + "/cch/status/group-price-coefficients";
+  const providerUsageEndpoint = window.location.origin + "/cch/status/provider-usage";
   const money = (value) => typeof value === "number"
     ? "$" + value.toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})
     : "—";
@@ -50,11 +51,11 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
         color: "rgb(5 150 105)",
       }};
     }}
-    if (value < 100) {{
+    if (value < 90) {{
       return {{
-        border: "rgb(234 179 8 / .6)",
-        background: "rgb(234 179 8 / .14)",
-        color: "rgb(161 98 7)",
+        border: "rgb(249 115 22 / .6)",
+        background: "rgb(249 115 22 / .14)",
+        color: "rgb(194 65 12)",
       }};
     }}
     return {{
@@ -65,6 +66,24 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   }};
   const pillStyle = (colors) =>
     `border:1px solid ${{colors.border}};border-radius:6px;padding:2px 8px;background:${{colors.background}};color:${{colors.color}};`;
+  const countdownStr = (resetsAt) => {{
+    if (!resetsAt) return null;
+    const diffMs = new Date(resetsAt).getTime() - Date.now();
+    if (!Number.isFinite(diffMs) || diffMs <= 0) return null;
+    const hours = Math.floor(diffMs / (1000 * 60 * 60));
+    const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+    if (hours >= 24) {{
+      const days = Math.floor(hours / 24);
+      return `${{days}}d${{hours % 24}}h`;
+    }}
+    if (hours > 0) return `${{hours}}h${{minutes}}m`;
+    return `${{minutes}}m`;
+  }};
+  const tierLabel = (name) => {{
+    if (name === "five_hour") return "5h";
+    if (name === "weekly_limit" || name === "seven_day") return "周";
+    return String(name || "");
+  }};
   const findGroupHeader = () => {{
     const link = document.querySelector(`a[href$="/status/${{statusGroupSlug}}"]`);
     if (!link) return null;
@@ -86,6 +105,10 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   const scheduleRenderPriceCoefficients = (data, attempts = 20) => {{
     if (renderPriceCoefficients(data) || attempts <= 0) return;
     window.setTimeout(() => scheduleRenderPriceCoefficients(data, attempts - 1), 250);
+  }};
+  const scheduleRenderProviderUsage = (data, attempts = 20) => {{
+    if (renderProviderUsage(data) || attempts <= 0) return;
+    window.setTimeout(() => scheduleRenderProviderUsage(data, attempts - 1), 250);
   }};
   const trophyStyle = (rank) => {{
     if (rank === 1) return "filter:none;background:rgb(250 204 21 / .16);border-color:rgb(250 204 21 / .55);";
@@ -202,6 +225,94 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
     }}
     return renderedAny || document.querySelector('a[href*="/status/"]') !== null;
   }};
+  let lastProviderUsageData = null;
+  // Same mount strategy as weekly consumption (renderQuota): find the group
+  // header row via the title link, then appendChild a badge strip as the last
+  // flex child. Do not nest into span.ml-auto or walk Collapsible siblings.
+  const findHeaderForSlug = (slug) => {{
+    const links = Array.from(document.querySelectorAll('a[href*="/status/"]'));
+    for (const link of links) {{
+      if (groupSlugFromHref(link.getAttribute("href")) !== slug) continue;
+      // Prefer the titled group link (skip icon-only external-link anchors).
+      if (!String(link.textContent || "").trim()) continue;
+      return link.closest("div.flex.items-center.gap-2") || link.parentElement;
+    }}
+    return null;
+  }};
+  const renderProviderUsage = (data) => {{
+    const groups = Array.isArray(data && data.groups) ? data.groups : [];
+    if (groups.length === 0) {{
+      // Drop the cached payload too, otherwise the countdown refresh below
+      // re-adds badges the server has since stopped reporting.
+      lastProviderUsageData = null;
+      document.querySelectorAll("[data-cch-provider-usage]").forEach((el) => el.remove());
+      return true;
+    }}
+    lastProviderUsageData = data;
+
+    const bySlug = new Map();
+    for (const group of groups) {{
+      const slugs = Array.isArray(group.statusGroupSlugs) ? group.statusGroupSlugs : [];
+      for (const slug of slugs) {{
+        if (!slug) continue;
+        if (!bySlug.has(slug)) bySlug.set(slug, group);
+      }}
+    }}
+
+    let renderedAny = false;
+    for (const [slug, group] of bySlug.entries()) {{
+      const header = findHeaderForSlug(slug);
+      if (!header) continue;
+
+      // Drop any stale node left in the wrong parent (e.g. model grid).
+      document.querySelectorAll(`span[data-cch-provider-usage="${{slug}}"]`).forEach((el) => {{
+        if (el.parentElement !== header) el.remove();
+      }});
+
+      let badges = header.querySelector(`:scope > span[data-cch-provider-usage="${{slug}}"]`);
+      if (!badges) {{
+        badges = document.createElement("span");
+        badges.dataset.cchProviderUsage = slug;
+        // Match weekly consumption strip: flex row of pills after header controls.
+        badges.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-left:8px;font-size:12px;color:var(--muted-foreground);";
+        header.appendChild(badges);
+      }}
+
+      // The server keeps serving the last good reading through a transient
+      // query failure; dim it so a frozen number is not mistaken for a live one.
+      badges.style.opacity = group.stale ? "0.55" : "1";
+      if (group.stale) {{
+        badges.title = "上次成功查询的数据，最新一次查询失败";
+      }} else {{
+        badges.removeAttribute("title");
+      }}
+
+      if (!group.success) {{
+        const style = pillStyle(palette(null));
+        badges.innerHTML = `<span style="${{style}}">用量查询失败</span>`;
+        renderedAny = true;
+        continue;
+      }}
+
+      const tiers = Array.isArray(group.tiers) ? group.tiers : [];
+      if (tiers.length === 0) {{
+        badges.innerHTML = "";
+        renderedAny = true;
+        continue;
+      }}
+      badges.innerHTML = tiers.map((tier) => {{
+        const util = typeof tier.utilization === "number" ? tier.utilization : null;
+        const style = pillStyle(palette(util));
+        const label = tierLabel(tier.name);
+        const utilText = typeof util === "number" ? Math.round(util) + "%" : "—";
+        const countdown = countdownStr(tier.resetsAt);
+        const countdownText = countdown ? ` · ${{countdown}}` : "";
+        return `<span style="${{style}}">${{escapeHtml(label)}} ${{utilText}}${{countdownText}}</span>`;
+      }}).join("");
+      renderedAny = true;
+    }}
+    return renderedAny || bySlug.size === 0;
+  }};
   const loadConsumption = () => {{
     fetch(consumptionEndpoint, {{ cache: "no-store" }})
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("weekly consumption unavailable")))
@@ -220,13 +331,24 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
       .then((body) => body && body.ok && scheduleRenderPriceCoefficients(body.data))
       .catch(() => {{}});
   }};
+  const loadProviderUsage = () => {{
+    fetch(providerUsageEndpoint, {{ cache: "no-store" }})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("provider usage unavailable")))
+      .then((body) => body && body.ok && scheduleRenderProviderUsage(body.data))
+      .catch(() => {{}});
+  }};
   const startEnhancements = () => {{
     loadConsumption();
     loadLeaderboard();
     loadPriceCoefficients();
+    loadProviderUsage();
     window.setInterval(loadConsumption, refreshMs);
     window.setInterval(loadLeaderboard, refreshMs);
     window.setInterval(loadPriceCoefficients, refreshMs);
+    window.setInterval(loadProviderUsage, Math.min(refreshMs, 30000));
+    window.setInterval(() => {{
+      if (lastProviderUsageData) renderProviderUsage(lastProviderUsageData);
+    }}, 30000);
   }};
   const waitForHydration = (attempts = 80) => {{
     if (window.next && document.querySelector("next-route-announcer")) {{

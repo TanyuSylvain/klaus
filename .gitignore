@@ -10,3 +10,6 @@ wheels/
 .venv
 config.yaml
 *.db
+
+# Runtime state
+data/

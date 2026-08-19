@@ -69,18 +69,32 @@ providers:
 #   # Real-provider coding-plan usage (Kimi / GLM / MiniMax only).
 #   # Queries 5h + weekly utilization from the vendor API (not CCH), displays
 #   # badges on status groups mapped via status_group_provider_groups, and
-#   # disables/enables all CCH providers in provider_group at 100% / reset.
+#   # disables/enables CCH providers in provider_group at 100% / reset.
 #   # base_url is optional: defaults are
 #   #   kimi    -> https://api.kimi.com/coding
 #   #   glm     -> https://open.bigmodel.cn
 #   #   minimax -> https://api.minimaxi.com
 #   # Override base_url only for regional variants (api.z.ai, api.minimax.io, …).
 #   # For kimi the base_url must include the /coding prefix; it is appended if missing.
-#   # At most one monitor per provider_group.
+#   # At most one monitor per provider_group. Use api_key for a single key
+#   # (manages every CCH provider in the group). Use api_keys to bind each key
+#   # to named CCH providers; enable/disable follows that key's quota, while the
+#   # status page shows the weighted-mean 5h and weekly utilization across keys.
+#   # Optional per-key weight (default 1.0) scales that key's contribution.
+#   # Multi-key monitors require a non-empty providers list on every key.
 #   usage_monitors:
 #     - provider_group: claude
 #       provider: glm
 #       api_key: "your-glm-coding-plan-key"
+#     # - provider_group: claude
+#     #   provider: glm
+#     #   api_keys:
+#     #     - api_key: "glm-key-a"
+#     #       providers: ["glm-prod-1", "glm-prod-2"]
+#     #       weight: 2.0
+#     #     - api_key: "glm-key-b"
+#     #       providers: ["glm-prod-3"]
+#     #       weight: 1.0
 #     - provider_group: minimax
 #       provider: minimax
 #       api_key: "your-minimax-key"

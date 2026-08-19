@@ -14,14 +14,12 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from cch_manage.coding_plan import (
-    TIER_FIVE_HOUR,
-    TIER_WEEKLY_LIMIT,
     CodingPlanQuota,
     UsageTier,
     query_coding_plan_quota,
 )
-from cch_manage.config import UsageMonitorConfig, UsageQueryConfig
-from cch_manage.utils import provider_enabled
+from cch_manage.config import UsageMonitorConfig, UsageMonitorKeyConfig, UsageQueryConfig
+from cch_manage.utils import cch_provider_name, datetime_from_iso, provider_enabled
 
 LOGGER = logging.getLogger("llm_proxy.cch_status.provider_usage")
 
@@ -137,6 +135,113 @@ def max_utilization(tiers: list[UsageTier]) -> float:
     if not tiers:
         return 0.0
     return max(tier.utilization for tier in tiers)
+
+
+def earliest_resets_at(values: list[str]) -> str | None:
+    best_raw: str | None = None
+    best_dt = None
+    for raw in values:
+        parsed = datetime_from_iso(raw)
+        if parsed is None:
+            continue
+        if best_dt is None or parsed < best_dt:
+            best_dt = parsed
+            best_raw = raw
+    return best_raw
+
+
+def average_snapshots(
+    snapshots: list[UsageSnapshot],
+    *,
+    disable_threshold_pct: float,
+    weights: list[float] | None = None,
+) -> UsageSnapshot | None:
+    if weights is None:
+        resolved_weights = [1.0] * len(snapshots)
+    elif len(weights) != len(snapshots):
+        raise ValueError("average_snapshots weights must match snapshots")
+    else:
+        resolved_weights = weights
+
+    successful = [
+        (snapshot, weight)
+        for snapshot, weight in zip(snapshots, resolved_weights, strict=True)
+        if snapshot.success
+    ]
+    if not successful:
+        return None
+
+    tier_order: list[str] = []
+    by_name: dict[str, list[tuple[UsageTier, float]]] = {}
+    for snapshot, weight in successful:
+        for tier in snapshot.tiers:
+            if tier.name not in by_name:
+                by_name[tier.name] = []
+                tier_order.append(tier.name)
+            by_name[tier.name].append((tier, weight))
+
+    averaged: list[UsageTier] = []
+    for name in tier_order:
+        items = by_name[name]
+        total_weight = sum(weight for _, weight in items)
+        utilization = (
+            sum(tier.utilization * weight for tier, weight in items) / total_weight
+            if total_weight > 0
+            else 0.0
+        )
+        resets = [tier.resets_at for tier, _ in items if tier.resets_at]
+        averaged.append(
+            UsageTier(
+                name=name,
+                utilization=utilization,
+                resets_at=earliest_resets_at(resets),
+            )
+        )
+
+    queried_at = None
+    queried_values = [
+        snapshot.queried_at for snapshot, _ in successful if snapshot.queried_at
+    ]
+    if queried_values:
+        queried_at = max(queried_values, key=_queried_at_sort_key)
+
+    labels = {snapshot.plan_label for snapshot, _ in successful}
+    plan_label = next(iter(labels)) if len(labels) == 1 else None
+
+    return UsageSnapshot(
+        success=True,
+        tiers=averaged,
+        exhausted=is_exhausted(averaged, disable_threshold_pct),
+        max_utilization=max_utilization(averaged),
+        error=None,
+        plan_label=plan_label,
+        queried_at=queried_at,
+    )
+
+
+def _queried_at_sort_key(value: str) -> datetime:
+    parsed = datetime_from_iso(value)
+    return parsed if parsed is not None else datetime.min.replace(tzinfo=UTC)
+
+
+def filter_providers_by_names(
+    providers: list[dict[str, Any]],
+    provider_names: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    if not provider_names:
+        return list(providers)
+    wanted = set(provider_names)
+    return [provider for provider in providers if cch_provider_name(provider) in wanted]
+
+
+def missing_provider_names(
+    providers: list[dict[str, Any]],
+    provider_names: tuple[str, ...],
+) -> list[str]:
+    if not provider_names:
+        return []
+    present = {cch_provider_name(provider) for provider in providers}
+    return [name for name in provider_names if name not in present]
 
 
 def snapshot_from_quota(
@@ -290,54 +395,116 @@ class ProviderUsageManager:
         self.monitors = list(monitors)
         self.query_config = query_config
         self.status_group_provider_groups = status_group_provider_groups
-        self._runtime: dict[str, MonitorRuntimeState] = {
-            monitor.provider_group: MonitorRuntimeState() for monitor in self.monitors
+        self._runtime: dict[tuple[str, str], MonitorRuntimeState] = {
+            (monitor.provider_group, key.key_id): MonitorRuntimeState()
+            for monitor in self.monitors
+            for key in monitor.keys
         }
         self._load_persisted_state()
 
+    def _iter_key_states(self):
+        for monitor in self.monitors:
+            for key in monitor.keys:
+                yield monitor, key, self._runtime[(monitor.provider_group, key.key_id)]
+
     def _load_persisted_state(self) -> None:
         raw = load_state_file(self.query_config.state_path)
-        for provider_group, state in self._runtime.items():
-            entry = raw.get(provider_group)
+        for monitor in self.monitors:
+            entry = raw.get(monitor.provider_group)
             if not isinstance(entry, dict):
                 continue
-            if "forceDisabled" in entry:
-                state.force_disabled = bool(entry["forceDisabled"])
-            last_raw = entry.get("last")
-            if isinstance(last_raw, dict):
-                state.last = UsageSnapshot.from_state_dict(last_raw)
-            elif entry.get("tiers") is not None or entry.get("exhausted") is not None:
-                # Backward-compatible flat shape.
-                state.last = UsageSnapshot.from_state_dict(entry)
+            keys_raw = entry.get("keys")
+            if isinstance(keys_raw, dict):
+                for key in monitor.keys:
+                    key_entry = keys_raw.get(key.key_id)
+                    if isinstance(key_entry, dict):
+                        self._apply_state_entry(
+                            self._runtime[(monitor.provider_group, key.key_id)],
+                            key_entry,
+                        )
+                continue
+            # Legacy flat shape: only attributable when the monitor has one key.
+            if len(monitor.keys) == 1:
+                self._apply_state_entry(
+                    self._runtime[(monitor.provider_group, monitor.keys[0].key_id)],
+                    entry,
+                )
+
+    @staticmethod
+    def _apply_state_entry(state: MonitorRuntimeState, entry: dict[str, Any]) -> None:
+        if "forceDisabled" in entry:
+            state.force_disabled = bool(entry["forceDisabled"])
+        last_raw = entry.get("last")
+        if isinstance(last_raw, dict):
+            state.last = UsageSnapshot.from_state_dict(last_raw)
+        elif entry.get("tiers") is not None or entry.get("exhausted") is not None:
+            # Backward-compatible flat shape.
+            state.last = UsageSnapshot.from_state_dict(entry)
 
     def _persist_state(self) -> None:
         payload: dict[str, Any] = {}
-        for provider_group, state in self._runtime.items():
-            entry: dict[str, Any] = {}
-            if state.force_disabled is not None:
-                entry["forceDisabled"] = state.force_disabled
-            snapshot = state.current if state.current and state.current.success else state.last
-            if snapshot is not None:
-                entry["last"] = snapshot.to_state_dict()
-            if entry:
-                payload[provider_group] = entry
+        for monitor in self.monitors:
+            keys_payload: dict[str, Any] = {}
+            for key in monitor.keys:
+                state = self._runtime[(monitor.provider_group, key.key_id)]
+                entry: dict[str, Any] = {}
+                if state.force_disabled is not None:
+                    entry["forceDisabled"] = state.force_disabled
+                snapshot = (
+                    state.current if state.current and state.current.success else state.last
+                )
+                if snapshot is not None:
+                    entry["last"] = snapshot.to_state_dict()
+                if entry:
+                    keys_payload[key.key_id] = entry
+            if keys_payload:
+                payload[monitor.provider_group] = {"keys": keys_payload}
         save_state_file(self.query_config.state_path, payload)
 
     def public_payload(self) -> dict[str, Any]:
         groups: list[dict[str, Any]] = []
         now = time.monotonic()
         for monitor in self.monitors:
-            state = self._runtime[monitor.provider_group]
-            snapshot, stale = self._display_snapshot(state)
-            next_interval = self.query_config.base_interval_seconds
-            if snapshot and snapshot.success:
+            display_snapshots: list[UsageSnapshot] = []
+            display_weights: list[float] = []
+            stale_any = False
+            force_flags: list[bool | None] = []
+            soonest_state: MonitorRuntimeState | None = None
+            for key in monitor.keys:
+                state = self._runtime[(monitor.provider_group, key.key_id)]
+                snapshot, stale = self._display_snapshot(state)
+                force_flags.append(state.force_disabled)
+                if soonest_state is None or state.next_poll_at < soonest_state.next_poll_at:
+                    soonest_state = state
+                if stale or (state.current is not None and not state.current.success):
+                    stale_any = True
+                if snapshot is not None and snapshot.success:
+                    display_snapshots.append(snapshot)
+                    display_weights.append(key.weight)
+
+            snapshot = average_snapshots(
+                display_snapshots,
+                disable_threshold_pct=self.query_config.disable_threshold_pct,
+                weights=display_weights,
+            )
+            failed = snapshot is None
+            next_interval = float(self.query_config.base_interval_seconds)
+            soonest_display, _ = (
+                self._display_snapshot(soonest_state)
+                if soonest_state is not None
+                else (None, False)
+            )
+            interval_source = (
+                soonest_display if soonest_display and soonest_display.success else snapshot
+            )
+            if interval_source is not None and interval_source.success:
                 next_interval = adaptive_interval_seconds(
-                    snapshot.max_utilization,
+                    interval_source.max_utilization,
                     base_interval_seconds=self.query_config.base_interval_seconds,
                     min_interval_seconds=self.query_config.min_interval_seconds,
                     high_usage_threshold_pct=self.query_config.high_usage_threshold_pct,
                 )
-            failed = snapshot is None or not snapshot.success
+            next_poll_at = soonest_state.next_poll_at if soonest_state is not None else now
             groups.append(
                 {
                     "providerGroup": monitor.provider_group,
@@ -347,15 +514,15 @@ class ProviderUsageManager:
                     ),
                     "provider": monitor.provider,
                     "success": not failed,
-                    "stale": stale,
+                    "stale": (not failed) and stale_any,
                     "tiers": snapshot.to_public_tiers() if snapshot else [],
                     "maxUtilization": (
                         round(snapshot.max_utilization, 2) if snapshot else None
                     ),
                     "exhausted": bool(snapshot.exhausted) if snapshot else False,
-                    "forceDisabled": state.force_disabled,
+                    "forceDisabled": _aggregate_force_disabled(force_flags),
                     "nextQueryIntervalSeconds": round(next_interval, 3),
-                    "nextQueryInSeconds": max(0.0, round(state.next_poll_at - now, 3)),
+                    "nextQueryInSeconds": max(0.0, round(next_poll_at - now, 3)),
                     "queriedAt": snapshot.queried_at if snapshot else None,
                     "planLabel": snapshot.plan_label if snapshot else None,
                     "error": PUBLIC_ERROR_MESSAGE if failed else None,
@@ -378,13 +545,10 @@ class ProviderUsageManager:
         return current or state.last, False
 
     def seconds_until_due(self) -> float:
-        """Seconds until the earliest monitor is due, for sleeping the poll loop."""
-        if not self.monitors:
+        """Seconds until the earliest key is due, for sleeping the poll loop."""
+        if not self._runtime:
             return float(self.query_config.base_interval_seconds)
-        earliest = min(
-            self._runtime[monitor.provider_group].next_poll_at
-            for monitor in self.monitors
-        )
+        earliest = min(state.next_poll_at for state in self._runtime.values())
         return max(0.0, earliest - time.monotonic())
 
     async def poll_due(
@@ -396,13 +560,13 @@ class ProviderUsageManager:
         force: bool = False,
     ) -> None:
         now = time.monotonic()
-        for monitor in self.monitors:
-            state = self._runtime[monitor.provider_group]
+        for monitor, key, state in self._iter_key_states():
             if not force and now < state.next_poll_at:
                 continue
             await self._poll_one(
                 client,
                 monitor,
+                key,
                 state,
                 get_group_providers=get_group_providers,
                 set_provider_enabled=set_provider_enabled,
@@ -412,28 +576,31 @@ class ProviderUsageManager:
         self,
         client: httpx.AsyncClient,
         monitor: UsageMonitorConfig,
+        key: UsageMonitorKeyConfig,
         state: MonitorRuntimeState,
         *,
         get_group_providers: GetGroupProviders,
         set_provider_enabled: SetProviderEnabled,
     ) -> None:
         LOGGER.info(
-            "querying coding-plan usage provider=%s group=%s",
+            "querying coding-plan usage provider=%s group=%s key=%s",
             monitor.provider,
             monitor.provider_group,
+            key.key_id,
         )
         try:
             quota = await query_coding_plan_quota(
                 client,
                 provider=monitor.provider,
                 base_url=monitor.base_url,
-                api_key=monitor.api_key,
+                api_key=key.api_key,
                 timeout_seconds=self.query_config.request_timeout_seconds,
             )
         except Exception as exc:
             LOGGER.exception(
-                "coding-plan usage query failed group=%s",
+                "coding-plan usage query failed group=%s key=%s",
                 monitor.provider_group,
+                key.key_id,
             )
             state.current = UsageSnapshot(
                 success=False,
@@ -459,8 +626,18 @@ class ProviderUsageManager:
                 )
                 providers = []
 
+            missing = missing_provider_names(providers, key.provider_names)
+            if missing:
+                LOGGER.warning(
+                    "usage monitor group=%s key=%s providers not found in CCH: %s",
+                    monitor.provider_group,
+                    key.key_id,
+                    missing,
+                )
+            managed = filter_providers_by_names(providers, key.provider_names)
+
             new_flag, manage_result = await apply_provider_manage(
-                providers,
+                managed,
                 force_disabled=state.force_disabled,
                 last=state.last,
                 current=current,
@@ -471,8 +648,9 @@ class ProviderUsageManager:
             await asyncio.to_thread(self._persist_state)
             if manage_result["action"] != "none":
                 LOGGER.info(
-                    "usage manage group=%s action=%s disabled=%s enabled=%s failed=%s",
+                    "usage manage group=%s key=%s action=%s disabled=%s enabled=%s failed=%s",
                     monitor.provider_group,
+                    key.key_id,
                     manage_result["action"],
                     manage_result["disabledProviderIds"],
                     manage_result["enabledProviderIds"],
@@ -487,10 +665,21 @@ class ProviderUsageManager:
             )
         else:
             LOGGER.warning(
-                "coding-plan usage query unsuccessful group=%s error=%s",
+                "coding-plan usage query unsuccessful group=%s key=%s error=%s",
                 monitor.provider_group,
+                key.key_id,
                 current.error,
             )
             interval = self.query_config.base_interval_seconds
 
         state.next_poll_at = time.monotonic() + max(1.0, interval)
+
+
+def _aggregate_force_disabled(flags: list[bool | None]) -> bool | None:
+    if any(flag is True for flag in flags):
+        return True
+    if flags and all(flag is None for flag in flags):
+        return None
+    if any(flag is False for flag in flags):
+        return False
+    return None

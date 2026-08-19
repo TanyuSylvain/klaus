@@ -35,6 +35,14 @@ def provider_enabled(provider: dict[str, Any]) -> bool:
     return False
 
 
+def cch_provider_name(provider: dict[str, Any]) -> str:
+    for field in ("name", "providerName", "provider_name"):
+        value = provider.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def parse_provider_groups(value: Any) -> list[str]:
     if value is None:
         return []

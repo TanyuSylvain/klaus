@@ -1,3 +1,5 @@
+import hashlib
+import math
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -11,12 +13,38 @@ from cch_manage.coding_plan import (
 from cch_manage.utils import parse_provider_groups
 
 
+def usage_monitor_key_id(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class UsageMonitorKeyConfig:
+    api_key: str
+    provider_names: tuple[str, ...]
+    key_id: str
+    weight: float = 1.0
+
+    @classmethod
+    def from_api_key(
+        cls,
+        api_key: str,
+        provider_names: tuple[str, ...] = (),
+        weight: float = 1.0,
+    ) -> "UsageMonitorKeyConfig":
+        return cls(
+            api_key=api_key,
+            provider_names=provider_names,
+            key_id=usage_monitor_key_id(api_key),
+            weight=weight,
+        )
+
+
 @dataclass(frozen=True)
 class UsageMonitorConfig:
     provider_group: str
     base_url: str
-    api_key: str
     provider: CodingPlanProvider
+    keys: tuple[UsageMonitorKeyConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -165,17 +193,15 @@ def parse_usage_monitors(value: Any) -> list[UsageMonitorConfig]:
 
         provider_group = str(item.get("provider_group", "")).strip()
         base_url = str(item.get("base_url", "")).strip().rstrip("/")
-        api_key = str(item.get("api_key", "")).strip()
+        path = f"cch_status.usage_monitors[{index}]"
         if not provider_group:
-            raise ValueError(f"cch_status.usage_monitors[{index}].provider_group is required")
-        if not api_key:
-            raise ValueError(f"cch_status.usage_monitors[{index}].api_key is required")
+            raise ValueError(f"{path}.provider_group is required")
         # Runtime state is keyed by provider_group; a duplicate would be silently
         # ignored rather than polled.
         if provider_group in seen_groups:
             raise ValueError(
-                f"cch_status.usage_monitors[{index}]: duplicate provider_group "
-                f"{provider_group!r}; each provider group may have at most one monitor"
+                f"{path}: duplicate provider_group {provider_group!r}; "
+                "each provider group may have at most one monitor"
             )
         seen_groups.add(provider_group)
 
@@ -184,20 +210,19 @@ def parse_usage_monitors(value: Any) -> list[UsageMonitorConfig]:
             provider = normalize_provider_name(str(explicit).strip())
             if provider is None:
                 raise ValueError(
-                    f"cch_status.usage_monitors[{index}].provider must be one of: "
-                    "kimi, glm, minimax"
+                    f"{path}.provider must be one of: kimi, glm, minimax"
                 )
         elif base_url:
             provider = detect_provider(base_url)
             if provider is None:
                 raise ValueError(
-                    f"cch_status.usage_monitors[{index}]: cannot detect provider from "
-                    f"base_url={base_url!r}; set provider explicitly to kimi, glm, or minimax"
+                    f"{path}: cannot detect provider from base_url={base_url!r}; "
+                    "set provider explicitly to kimi, glm, or minimax"
                 )
         else:
             raise ValueError(
-                f"cch_status.usage_monitors[{index}]: set provider (kimi|glm|minimax) "
-                "or base_url so the coding-plan vendor can be resolved"
+                f"{path}: set provider (kimi|glm|minimax) or base_url so the "
+                "coding-plan vendor can be resolved"
             )
 
         if not base_url:
@@ -207,8 +232,117 @@ def parse_usage_monitors(value: Any) -> list[UsageMonitorConfig]:
             UsageMonitorConfig(
                 provider_group=provider_group,
                 base_url=base_url,
-                api_key=api_key,
                 provider=provider,
+                keys=parse_usage_monitor_keys(item, path),
             )
         )
     return monitors
+
+
+def parse_usage_monitor_keys(item: dict[str, Any], path: str) -> tuple[UsageMonitorKeyConfig, ...]:
+    singular = str(item.get("api_key", "")).strip() if item.get("api_key") is not None else ""
+    has_singular = bool(singular)
+    has_list = item.get("api_keys") is not None
+    if has_singular and has_list:
+        raise ValueError(f"{path}: set either api_key or api_keys, not both")
+
+    if has_list:
+        if item.get("providers") is not None:
+            raise ValueError(
+                f"{path}: set providers on each api_keys entry, not on the monitor"
+            )
+        if item.get("weight") is not None:
+            raise ValueError(
+                f"{path}: set weight on each api_keys entry, not on the monitor"
+            )
+        keys = _parse_api_keys_list(item.get("api_keys"), path)
+    elif has_singular:
+        keys = (
+            UsageMonitorKeyConfig.from_api_key(
+                singular,
+                parse_key_provider_names(item.get("providers"), path),
+                parse_key_weight(item.get("weight"), path),
+            ),
+        )
+    else:
+        raise ValueError(f"{path}: api_key or api_keys is required")
+
+    if len(keys) > 1:
+        for key_index, key in enumerate(keys):
+            if not key.provider_names:
+                raise ValueError(
+                    f"{path}.api_keys[{key_index}].providers is required when "
+                    "a monitor has more than one api_key"
+                )
+
+    seen_names: set[str] = set()
+    for key_index, key in enumerate(keys):
+        for name in key.provider_names:
+            if name in seen_names:
+                location = (
+                    f"{path}.api_keys[{key_index}]"
+                    if has_list
+                    else path
+                )
+                raise ValueError(
+                    f"{location}: duplicate CCH provider name {name!r}; "
+                    "each provider may be assigned to at most one api_key"
+                )
+            seen_names.add(name)
+    return keys
+
+
+def _parse_api_keys_list(value: Any, path: str) -> tuple[UsageMonitorKeyConfig, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{path}.api_keys must be a non-empty list")
+
+    keys: list[UsageMonitorKeyConfig] = []
+    seen_keys: set[str] = set()
+    for index, item in enumerate(value):
+        entry_path = f"{path}.api_keys[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{entry_path} must be a mapping")
+        api_key = str(item.get("api_key", "")).strip()
+        if not api_key:
+            raise ValueError(f"{entry_path}.api_key is required")
+        if api_key in seen_keys:
+            raise ValueError(f"{entry_path}: duplicate api_key")
+        seen_keys.add(api_key)
+        keys.append(
+            UsageMonitorKeyConfig.from_api_key(
+                api_key,
+                parse_key_provider_names(item.get("providers"), entry_path),
+                parse_key_weight(item.get("weight"), entry_path),
+            )
+        )
+    return tuple(keys)
+
+
+def parse_key_weight(value: Any, path: str) -> float:
+    if value is None:
+        return 1.0
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{path}.weight must be a positive number")
+    try:
+        weight = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}.weight must be a positive number") from exc
+    if not math.isfinite(weight) or weight <= 0:
+        raise ValueError(f"{path}.weight must be a finite number > 0")
+    return weight
+
+
+def parse_key_provider_names(value: Any, path: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"{path}.providers must be a list")
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        name = str(item).strip() if item is not None else ""
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return tuple(names)

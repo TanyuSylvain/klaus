@@ -13,7 +13,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from cch_manage import client as cch_client
+from cch_manage.client import CchClient, weekly_usage_decimal
 from cch_manage.config import CchStatusConfig
 from cch_manage.leaderboard import (
     active_leaderboard_entries,
@@ -31,6 +31,7 @@ from cch_manage.utils import (
     decimal_from_any,
     money_float,
     percent_float,
+    provider_groups,
     public_status_ttl_seconds,
     seconds_until,
 )
@@ -50,6 +51,7 @@ class CchStatusFeature:
     def __init__(self, config: CchStatusConfig):
         self.config = config
         self.client: httpx.AsyncClient | None = None
+        self._cch: CchClient | None = None
         self._cache: dict[str, Any] | None = None
         self._cache_expires_at = 0.0
         self._leaderboard_cache: dict[str, Any] | None = None
@@ -84,6 +86,7 @@ class CchStatusFeature:
 
     async def start(self, client_kwargs: dict[str, Any]) -> None:
         self.client = httpx.AsyncClient(**client_kwargs)
+        self._cch = CchClient(self.client, self.config.base_url, self.config.admin_token)
         if self._usage_manager is not None:
             self._usage_task = asyncio.create_task(
                 self._usage_monitor_loop(),
@@ -289,16 +292,14 @@ class CchStatusFeature:
             return self._cache
 
         week_start, week_end = self._current_week_range()
-        _, providers = await cch_client.get_claude_group_providers(
-            self._post_action,
-            self.config.provider_group,
-        )
+        providers = await self._providers_in_group(self.config.provider_group)
         provider_ids = [int(provider["id"]) for provider in providers if provider.get("id") is not None]
 
         used = decimal_from_any(0)
-        for provider_id in provider_ids:
-            provider_used = await cch_client.get_provider_weekly_usage(self._post_action, provider_id)
-            used += provider_used
+        if provider_ids:
+            usages = await self._require_cch().get_providers_limit_usage(provider_ids)
+            for provider_id in provider_ids:
+                used += weekly_usage_decimal(usages[provider_id])
 
         quota = self.config.weekly_quota_usd
         remaining = quota - used if quota is not None else None
@@ -337,7 +338,7 @@ class CchStatusFeature:
         leaderboard: list[dict[str, Any]] = []
         if self.config.weekly_leaderboard_enabled:
             leaderboard = await build_weekly_leaderboard(
-                self._post_action,
+                self._require_cch(),
                 week_start,
                 week_end,
                 ZoneInfo(self.config.timezone),
@@ -410,14 +411,17 @@ class CchStatusFeature:
         ):
             return self._price_coefficients_cache
 
-        providers, _ = await cch_client.get_claude_group_providers(
-            self._post_action,
-            self.config.provider_group,
+        providers = await self._require_cch().list_providers()
+        public_status = await self._get_public_status_payload("include=groups")
+        raw_groups = public_status.get("groups")
+        public_status_groups = (
+            [group for group in raw_groups if isinstance(group, dict)]
+            if isinstance(raw_groups, list)
+            else []
         )
-        public_status = await cch_client.get_public_status_groups(self._get_public_status_payload)
         groups = extract_group_price_coefficients(
             providers,
-            public_status,
+            public_status_groups,
             self.config.status_group_provider_groups,
         )
         payload = {
@@ -475,11 +479,7 @@ class CchStatusFeature:
         return payload
 
     async def _fetch_public_status(self, query: str) -> tuple[dict[str, Any], int]:
-        return await cch_client.fetch_public_status(
-            self._require_client(),
-            self.config.base_url,
-            query,
-        )
+        return await self._require_cch().get_public_status(query)
 
     def _current_week_range(self) -> tuple[datetime, datetime]:
         tz = ZoneInfo(self.config.timezone)
@@ -509,7 +509,7 @@ class CchStatusFeature:
 
     async def _set_provider_enabled(self, provider_id: int, enabled: bool) -> bool:
         try:
-            await cch_client.set_provider_enabled(self._post_action, provider_id, enabled)
+            await self._require_cch().set_provider_enabled(provider_id, enabled)
         except Exception:
             LOGGER.exception(
                 "failed to set CCH provider enabled state",
@@ -518,12 +518,15 @@ class CchStatusFeature:
             return False
         return True
 
+    async def _providers_in_group(self, provider_group: str) -> list[dict[str, Any]]:
+        providers = await self._require_cch().list_providers()
+        return [
+            provider for provider in providers
+            if provider_group in provider_groups(provider)
+        ]
+
     async def _get_group_providers(self, provider_group: str) -> list[dict[str, Any]]:
-        _, group_providers = await cch_client.get_claude_group_providers(
-            self._post_action,
-            provider_group,
-        )
-        return group_providers
+        return await self._providers_in_group(provider_group)
 
     async def _usage_monitor_loop(self) -> None:
         assert self._usage_manager is not None
@@ -547,16 +550,12 @@ class CchStatusFeature:
             # deadline cannot park the loop indefinitely.
             await asyncio.sleep(min(max(delay, 1.0), 60.0))
 
-    async def _post_action(self, path: str, payload: dict[str, Any]) -> Any:
-        return await cch_client.post_action(
-            self._require_client(),
-            self.config.base_url,
-            self.config.admin_token,
-            path,
-            payload,
-        )
-
     def _require_client(self) -> httpx.AsyncClient:
         if self.client is None:
             raise RuntimeError("CCH status client is not started")
         return self.client
+
+    def _require_cch(self) -> CchClient:
+        if self._cch is None:
+            raise RuntimeError("CCH status client is not started")
+        return self._cch

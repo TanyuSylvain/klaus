@@ -1,9 +1,10 @@
 from datetime import datetime
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Awaitable, Callable
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from cch_manage.client import CchClient
 from cch_manage.utils import (
     decimal_from_any,
     int_from_any,
@@ -11,23 +12,16 @@ from cch_manage.utils import (
     parse_statistics_date,
 )
 
-PostAction = Callable[[str, dict[str, Any]], Awaitable[Any]]
-
 
 async def get_weekly_leaderboard(
-    post: PostAction,
+    cch: CchClient,
     week_start: datetime,
     week_end: datetime,
     tz: ZoneInfo,
 ) -> list[dict[str, Any]]:
-    statistics_data = await post(
-        "/api/actions/statistics/getUserStatistics",
-        {"timeRange": "7days"},
-    )
-    statistics_users = statistics_users_from_datasets(
-        statistics_data if isinstance(statistics_data, list) else [statistics_data]
-    )
-    api_keys_by_user = await get_api_key_hashes_by_user(post, statistics_users)
+    statistics_data = await cch.get_dashboard_statistics("7days")
+    statistics_users = statistics_users_from_datasets([statistics_data])
+    api_keys_by_user = await get_api_key_hashes_by_user(cch, statistics_users)
     return extract_weekly_leaderboard(
         statistics_data,
         week_start,
@@ -38,7 +32,7 @@ async def get_weekly_leaderboard(
 
 
 async def get_api_key_hashes_by_user(
-    post: PostAction,
+    cch: CchClient,
     statistics_users: list[dict[str, Any]],
 ) -> dict[str, list[str]]:
     hashes_by_user: dict[str, list[str]] = {}
@@ -48,11 +42,17 @@ async def get_api_key_hashes_by_user(
         if user_id is None or not isinstance(data_key, str):
             continue
 
-        keys_data = await post(
-            "/api/actions/keys/getKeys",
-            {"userId": int(user_id)},
-        )
-        key_hashes = extract_api_key_hashes(keys_data)
+        api_keys: list[str] = []
+        for key_entry in await cch.list_user_keys(int(user_id)):
+            # Soft-deleted keys never authenticate requests; skip them.
+            if key_entry.get("deletedAt") is not None:
+                continue
+            key_id = key_entry.get("id")
+            if key_id is None:
+                continue
+            api_keys.append(await cch.reveal_key(int(key_id)))
+
+        key_hashes = extract_api_key_hashes(api_keys)
         if key_hashes:
             hashes_by_user[data_key] = key_hashes
     return hashes_by_user
@@ -141,15 +141,9 @@ def statistics_users_from_datasets(datasets: list[Any]) -> list[dict[str, Any]]:
     return list(users_by_key.values())
 
 
-def extract_api_key_hashes(data: Any) -> list[str]:
-    if not isinstance(data, list):
-        return []
-
+def extract_api_key_hashes(api_keys: list[str]) -> list[str]:
     key_hashes: set[str] = set()
-    for key in data:
-        if not isinstance(key, dict):
-            continue
-        api_key = key.get("key")
+    for api_key in api_keys:
         if isinstance(api_key, str) and api_key:
             key_hashes.add(api_key_hash(api_key))
 

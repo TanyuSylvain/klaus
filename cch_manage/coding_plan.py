@@ -279,6 +279,13 @@ async def _query_zhipu(
     return zhipu_quota_from_body(body)
 
 
+# Lower rank wins when the same 5h/weekly window has multiple limit types.
+_ZHIPU_USAGE_LIMIT_RANKS = {
+    "TOKENS_LIMIT": 0,
+    "CREDIT_LIMIT": 1,
+}
+
+
 def classify_zhipu_window(item: dict[str, Any]) -> str | None:
     unit = item.get("unit")
     try:
@@ -292,9 +299,35 @@ def classify_zhipu_window(item: dict[str, Any]) -> str | None:
     return None
 
 
+def _zhipu_limit_utilization(item: dict[str, Any]) -> float:
+    limit_type = str(item.get("type") or "").upper()
+    if limit_type == "CREDIT_LIMIT":
+        quota = parse_f64(item.get("usage"))
+        used = parse_f64(item.get("currentValue"))
+        if quota is not None and quota > 0 and used is not None:
+            return used / quota * 100.0
+    return parse_f64(item.get("percentage")) or 0.0
+
+
+def _assign_zhipu_window(
+    slot: tuple[int | None, float, str | None] | None,
+    slot_rank: int,
+    entry: tuple[int | None, float, str | None],
+    entry_rank: int,
+) -> tuple[tuple[int | None, float, str | None] | None, int, bool]:
+    """Return (slot, rank, consumed). Unconsumed entries go to unclassified."""
+    if slot is None or entry_rank < slot_rank:
+        return entry, entry_rank, True
+    if entry_rank == slot_rank:
+        return slot, slot_rank, False
+    return slot, slot_rank, True
+
+
 def parse_zhipu_token_tiers(data: dict[str, Any]) -> list[UsageTier]:
     five_hour: tuple[int | None, float, str | None] | None = None
     weekly: tuple[int | None, float, str | None] | None = None
+    five_hour_rank = 1_000
+    weekly_rank = 1_000
     unclassified: list[tuple[int | None, float, str | None]] = []
 
     limits = data.get("limits")
@@ -304,22 +337,31 @@ def parse_zhipu_token_tiers(data: dict[str, Any]) -> list[UsageTier]:
     for limit_item in limits:
         if not isinstance(limit_item, dict):
             continue
-        limit_type = str(limit_item.get("type") or "")
-        if limit_type.upper() != "TOKENS_LIMIT":
+        limit_type = str(limit_item.get("type") or "").upper()
+        entry_rank = _ZHIPU_USAGE_LIMIT_RANKS.get(limit_type)
+        if entry_rank is None:
             continue
-        percentage = parse_f64(limit_item.get("percentage")) or 0.0
+        utilization = _zhipu_limit_utilization(limit_item)
         reset_ms_raw = limit_item.get("nextResetTime")
         try:
             reset_ms = int(reset_ms_raw) if reset_ms_raw is not None else None
         except (TypeError, ValueError):
             reset_ms = None
         reset_iso = extract_reset_time(reset_ms)
-        entry = (reset_ms, percentage, reset_iso)
+        entry = (reset_ms, utilization, reset_iso)
         window = classify_zhipu_window(limit_item)
-        if window == TIER_FIVE_HOUR and five_hour is None:
-            five_hour = entry
-        elif window == TIER_WEEKLY_LIMIT and weekly is None:
-            weekly = entry
+        if window == TIER_FIVE_HOUR:
+            five_hour, five_hour_rank, consumed = _assign_zhipu_window(
+                five_hour, five_hour_rank, entry, entry_rank
+            )
+            if not consumed:
+                unclassified.append(entry)
+        elif window == TIER_WEEKLY_LIMIT:
+            weekly, weekly_rank, consumed = _assign_zhipu_window(
+                weekly, weekly_rank, entry, entry_rank
+            )
+            if not consumed:
+                unclassified.append(entry)
         else:
             unclassified.append(entry)
 
@@ -334,8 +376,8 @@ def parse_zhipu_token_tiers(data: dict[str, Any]) -> list[UsageTier]:
     for name, slot in ((TIER_FIVE_HOUR, five_hour), (TIER_WEEKLY_LIMIT, weekly)):
         if slot is None:
             continue
-        _, percentage, resets_at = slot
-        tiers.append(UsageTier(name=name, utilization=percentage, resets_at=resets_at))
+        _, utilization, resets_at = slot
+        tiers.append(UsageTier(name=name, utilization=utilization, resets_at=resets_at))
     return tiers
 
 

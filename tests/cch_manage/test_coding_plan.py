@@ -87,6 +87,153 @@ def test_parse_zhipu_token_tiers_by_unit():
     assert tiers[0].resets_at is not None
 
 
+def test_parse_zhipu_credit_limit_converts_to_percentage():
+    data = {
+        "limits": [
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "usage": 12000,
+                "currentValue": 0,
+                "remaining": 12000,
+                "percentage": 0,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 6,
+                "number": 1,
+                "usage": 60000,
+                "currentValue": 2727,
+                "remaining": 57272,
+                "percentage": 4,
+                "nextResetTime": 1789378222987,
+            },
+        ]
+    }
+    tiers = parse_zhipu_token_tiers(data)
+    assert [t.name for t in tiers] == [TIER_FIVE_HOUR, TIER_WEEKLY_LIMIT]
+    assert tiers[0].utilization == 0.0
+    assert tiers[0].resets_at is None
+    assert tiers[1].utilization == 2727 / 60000 * 100.0
+    assert tiers[1].resets_at is not None
+
+
+def test_parse_zhipu_credit_limit_without_percentage():
+    data = {
+        "limits": [
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "usage": 1000,
+                "currentValue": 250,
+            }
+        ]
+    }
+    tiers = parse_zhipu_token_tiers(data)
+    assert len(tiers) == 1
+    assert tiers[0].name == TIER_FIVE_HOUR
+    assert tiers[0].utilization == 25.0
+
+
+def test_parse_zhipu_credit_limit_falls_back_to_percentage():
+    data = {
+        "limits": [
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "percentage": 33.0,
+            }
+        ]
+    }
+    tiers = parse_zhipu_token_tiers(data)
+    assert len(tiers) == 1
+    assert tiers[0].utilization == 33.0
+
+
+def test_parse_zhipu_prefers_tokens_limit_over_credit_limit():
+    data = {
+        "limits": [
+            {
+                "type": "TIME_LIMIT",
+                "unit": 5,
+                "percentage": 1,
+                "usage": 4000,
+                "currentValue": 21,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "usage": 12000,
+                "currentValue": 6000,
+                "percentage": 50,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 6,
+                "usage": 60000,
+                "currentValue": 30000,
+                "percentage": 50,
+                "nextResetTime": 1789378222987,
+            },
+            {
+                "type": "TOKENS_LIMIT",
+                "unit": 3,
+                "percentage": 12.5,
+            },
+            {
+                "type": "TOKENS_LIMIT",
+                "unit": 6,
+                "percentage": 80.0,
+                "nextResetTime": 1788942588998,
+            },
+        ]
+    }
+    tiers = parse_zhipu_token_tiers(data)
+    assert [t.name for t in tiers] == [TIER_FIVE_HOUR, TIER_WEEKLY_LIMIT]
+    assert tiers[0].utilization == 12.5
+    assert tiers[1].utilization == 80.0
+
+
+def test_zhipu_quota_from_body_credit_limit_pro_plan():
+    result = zhipu_quota_from_body(
+        {
+            "code": 200,
+            "msg": "Operation successful",
+            "success": True,
+            "data": {
+                "level": "pro",
+                "limits": [
+                    {
+                        "type": "CREDIT_LIMIT",
+                        "unit": 3,
+                        "number": 5,
+                        "usage": 12000,
+                        "currentValue": 0,
+                        "remaining": 12000,
+                        "percentage": 0,
+                    },
+                    {
+                        "type": "CREDIT_LIMIT",
+                        "unit": 6,
+                        "number": 1,
+                        "usage": 60000,
+                        "currentValue": 2727,
+                        "remaining": 57272,
+                        "percentage": 4,
+                        "nextResetTime": 1789378222987,
+                    },
+                ],
+            },
+        }
+    )
+    assert result.success is True
+    assert result.plan_label == "pro"
+    assert [t.name for t in result.tiers] == [TIER_FIVE_HOUR, TIER_WEEKLY_LIMIT]
+    assert result.tiers[0].utilization == 0.0
+    assert result.tiers[1].utilization == 2727 / 60000 * 100.0
+
+
 def test_zhipu_quota_from_body_error():
     result = zhipu_quota_from_body({"success": False, "msg": "nope"})
     assert result.success is False

@@ -2,7 +2,12 @@ import asyncio
 from pathlib import Path
 
 from cch_manage.coding_plan import TIER_FIVE_HOUR, TIER_WEEKLY_LIMIT, UsageTier
-from cch_manage.config import UsageMonitorConfig, UsageMonitorKeyConfig, UsageQueryConfig
+from cch_manage.config import (
+    UsageMonitorConfig,
+    UsageMonitorKeyConfig,
+    UsageQueryConfig,
+    usage_monitor_key_id,
+)
 from cch_manage.provider_usage import (
     PUBLIC_ERROR_MESSAGE,
     ProviderUsageManager,
@@ -15,6 +20,7 @@ from cch_manage.provider_usage import (
     should_enable_providers,
     status_slugs_for_provider_group,
 )
+from cch_manage.status_page import inject_status_script
 
 
 def _key(
@@ -198,6 +204,14 @@ def test_public_payload_falls_back_to_last_good_snapshot(tmp_path: Path):
     assert group["stale"] is True
     assert group["tiers"] == [{"name": TIER_FIVE_HOUR, "utilization": 42.0, "resetsAt": None}]
     assert group["error"] is None
+    assert group["keyUsages"] == [
+        {
+            "success": True,
+            "stale": True,
+            "tiers": [{"name": TIER_FIVE_HOUR, "utilization": 42.0, "resetsAt": None}],
+            "error": None,
+        }
+    ]
 
 
 def test_public_payload_hides_vendor_error_detail(tmp_path: Path):
@@ -212,6 +226,9 @@ def test_public_payload_hides_vendor_error_detail(tmp_path: Path):
     assert group["success"] is False
     assert group["stale"] is False
     assert group["error"] == PUBLIC_ERROR_MESSAGE
+    assert group["keyUsages"] == [
+        {"success": False, "stale": False, "tiers": [], "error": PUBLIC_ERROR_MESSAGE}
+    ]
     assert "secret-detail" not in str(group)
     assert "autoManage" not in group
 
@@ -380,6 +397,27 @@ def test_public_payload_averages_keys_and_marks_stale(tmp_path: Path):
     assert group["maxUtilization"] == 70.0
     assert group["error"] is None
     assert "secret" not in str(group)
+    assert "key-a" not in str(group)
+    assert "glm-a" not in str(group)
+    assert usage_monitor_key_id("key-a") not in str(group)
+    assert usage_monitor_key_id("key-b") not in str(group)
+    key_usages = group["keyUsages"]
+    assert len(key_usages) == 2
+    assert set(key_usages[0]) == {"success", "stale", "tiers", "error"}
+    assert key_usages[0]["success"] is True
+    assert key_usages[0]["stale"] is False
+    assert key_usages[0]["tiers"][0]["utilization"] == 80.0
+    assert key_usages[1]["success"] is True
+    assert key_usages[1]["stale"] is True
+    assert key_usages[1]["tiers"][0]["utilization"] == 40.0
+
+
+def test_inject_status_script_has_usage_key_tooltip():
+    html = inject_status_script("<body></body>", "opus", 300)
+    assert "cch-provider-usage-tooltip" in html
+    assert "keyUsages" in html
+    assert "showUsageTooltip" in html
+    assert "onmouseenter" in html
 
 
 def test_legacy_state_migrates_onto_single_key(tmp_path: Path):

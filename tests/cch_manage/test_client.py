@@ -253,6 +253,47 @@ def test_get_dashboard_statistics_sends_time_range():
     assert seen["params"] == {"timeRange": "7days"}
 
 
+def test_get_usage_log_stats_sends_provider_and_window():
+    seen: dict[str, Any] = {}
+    payload = {"totalRequests": 20, "totalCost": 9.56, "totalTokens": 12009858}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        return _json_response(payload)
+
+    cch, _ = _make_client(handler)
+
+    async def run() -> None:
+        assert await cch.get_usage_log_stats(
+            provider_id=18,
+            start_time_ms=1000,
+            end_time_ms=2000,
+        ) == payload
+
+    asyncio.run(run())
+    assert seen["path"] == "/api/v1/usage-logs/stats"
+    assert seen["params"] == {
+        "providerId": "18",
+        "startTime": "1000",
+        "endTime": "2000",
+    }
+
+
+def test_get_usage_log_stats_rejects_bad_shape():
+    cch, _ = _make_client(lambda request: _json_response([1, 2, 3]))
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="unexpected data shape"):
+            await cch.get_usage_log_stats(
+                provider_id=18,
+                start_time_ms=1000,
+                end_time_ms=2000,
+            )
+
+    asyncio.run(run())
+
+
 def test_list_user_keys_unwraps_items():
     key = {"id": 11, "maskedKey": "sk-x", "isEnabled": True, "deletedAt": None}
 

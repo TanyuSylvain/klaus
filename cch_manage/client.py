@@ -119,6 +119,29 @@ class CchClient:
             raise RuntimeError("CCH dashboard statistics returned unexpected data shape")
         return body
 
+    async def get_usage_log_stats(
+        self,
+        *,
+        provider_id: int,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> dict[str, Any]:
+        response = await self._send(
+            "GET",
+            "/api/v1/usage-logs/stats",
+            params={
+                "providerId": provider_id,
+                "startTime": start_time_ms,
+                "endTime": end_time_ms,
+            },
+        )
+        self._raise_for_problem(response)
+
+        body = response.json()
+        if not isinstance(body, dict):
+            raise RuntimeError("CCH usage log stats returned unexpected data shape")
+        return body
+
     async def list_user_keys(self, user_id: int) -> list[dict[str, Any]]:
         response = await self._send("GET", f"/api/v1/users/{user_id}/keys")
         self._raise_for_problem(response)

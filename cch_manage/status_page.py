@@ -15,6 +15,7 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
   const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
   const priceCoefficientsEndpoint = window.location.origin + "/cch/status/group-price-coefficients";
+  const groupUsageEndpoint = window.location.origin + "/cch/status/group-usage";
   const providerUsageEndpoint = window.location.origin + "/cch/status/provider-usage";
   const money = (value) => typeof value === "number"
     ? "$" + value.toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})
@@ -27,6 +28,15 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   const compactNumber = (value) => typeof value === "number"
     ? value.toLocaleString(undefined, {{ maximumFractionDigits: 0 }})
     : "0";
+  const tokensM = (value) => {{
+    if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+    const millions = value / 1e6;
+    const digits = millions >= 100 ? 0 : 1;
+    return millions.toLocaleString(undefined, {{
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }}) + " M";
+  }};
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({{
     "&": "&amp;",
     "<": "&lt;",
@@ -84,6 +94,66 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
     if (name === "weekly_limit" || name === "seven_day") return "周";
     return String(name || "");
   }};
+  const usageTierPills = (tiers) => (Array.isArray(tiers) ? tiers : []).map((tier) => {{
+    const util = typeof tier.utilization === "number" ? tier.utilization : null;
+    const style = pillStyle(palette(util));
+    const label = tierLabel(tier.name);
+    const utilText = typeof util === "number" ? Math.round(util) + "%" : "—";
+    const countdown = countdownStr(tier.resetsAt);
+    const countdownText = countdown ? ` · ${{countdown}}` : "";
+    return `<span style="${{style}}">${{escapeHtml(label)}} ${{utilText}}${{countdownText}}</span>`;
+  }}).join("");
+  let usageTooltipSlug = null;
+  const ensureUsageTooltip = () => {{
+    let tip = document.getElementById("cch-provider-usage-tooltip");
+    if (tip) return tip;
+    tip = document.createElement("div");
+    tip.id = "cch-provider-usage-tooltip";
+    tip.style.cssText = `position:fixed;z-index:2147483647;display:none;pointer-events:none;min-width:140px;max-width:min(360px,calc(100vw - 16px));padding:10px;border:1px solid ${{alpha("--border", 60)}};border-radius:10px;background:hsl(var(--card) / .96);color:var(--foreground);box-shadow:0 8px 24px rgb(0 0 0 / .18);backdrop-filter:blur(8px);font-size:12px;line-height:1.25;`;
+    document.body.appendChild(tip);
+    return tip;
+  }};
+  const hideUsageTooltip = () => {{
+    usageTooltipSlug = null;
+    const tip = document.getElementById("cch-provider-usage-tooltip");
+    if (tip) tip.style.display = "none";
+  }};
+  const positionUsageTooltip = (anchor, tip) => {{
+    const rect = anchor.getBoundingClientRect();
+    const gap = 8;
+    const tipRect = tip.getBoundingClientRect();
+    let left = rect.left;
+    let top = rect.bottom + gap;
+    if (left + tipRect.width > window.innerWidth - 8) {{
+      left = window.innerWidth - tipRect.width - 8;
+    }}
+    if (left < 8) left = 8;
+    if (top + tipRect.height > window.innerHeight - 8) {{
+      top = rect.top - tipRect.height - gap;
+    }}
+    if (top < 8) top = 8;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }};
+  const showUsageTooltip = (anchor, slug, group) => {{
+    const keyUsages = Array.isArray(group && group.keyUsages) ? group.keyUsages : [];
+    if (keyUsages.length === 0) {{
+      hideUsageTooltip();
+      return;
+    }}
+    const tip = ensureUsageTooltip();
+    usageTooltipSlug = slug;
+    tip.innerHTML = keyUsages.map((entry) => {{
+      if (!entry || !entry.success) {{
+        const style = pillStyle(palette(null));
+        return `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;"><span style="${{style}}">用量查询失败</span></div>`;
+      }}
+      const opacity = entry.stale ? "0.55" : "1";
+      return `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;opacity:${{opacity}};">${{usageTierPills(entry.tiers)}}</div>`;
+    }}).join(`<div style="height:8px;"></div>`);
+    tip.style.display = "block";
+    positionUsageTooltip(anchor, tip);
+  }};
   const findGroupHeader = () => {{
     const link = document.querySelector(`a[href$="/status/${{statusGroupSlug}}"]`);
     if (!link) return null;
@@ -109,6 +179,10 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   const scheduleRenderProviderUsage = (data, attempts = 20) => {{
     if (renderProviderUsage(data) || attempts <= 0) return;
     window.setTimeout(() => scheduleRenderProviderUsage(data, attempts - 1), 250);
+  }};
+  const scheduleRenderGroupUsage = (data, attempts = 20) => {{
+    if (renderGroupUsage(data) || attempts <= 0) return;
+    window.setTimeout(() => scheduleRenderGroupUsage(data, attempts - 1), 250);
   }};
   const trophyStyle = (rank) => {{
     if (rank === 1) return "filter:none;background:rgb(250 204 21 / .16);border-color:rgb(250 204 21 / .55);";
@@ -195,6 +269,11 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
   }};
   const coefficientBadgeStyle = () =>
     "border:1px solid rgb(16 185 129 / .55);border-radius:6px;background:rgb(16 185 129 / .12);padding:2px 8px;font-size:12px;line-height:1.25;color:rgb(5 150 105);";
+  const usageBadgeColors = {{
+    border: "rgb(59 130 246 / .55)",
+    background: "rgb(59 130 246 / .12)",
+    color: "rgb(37 99 235)",
+  }};
   const renderPriceCoefficients = (data) => {{
     const groups = data && data.groups && typeof data.groups === "object" ? data.groups : null;
     if (!groups) return true;
@@ -245,6 +324,7 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
       // Drop the cached payload too, otherwise the countdown refresh below
       // re-adds badges the server has since stopped reporting.
       lastProviderUsageData = null;
+      hideUsageTooltip();
       document.querySelectorAll("[data-cch-provider-usage]").forEach((el) => el.remove());
       return true;
     }}
@@ -290,28 +370,70 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
       if (!group.success) {{
         const style = pillStyle(palette(null));
         badges.innerHTML = `<span style="${{style}}">用量查询失败</span>`;
-        renderedAny = true;
-        continue;
+      }} else {{
+        const tiers = Array.isArray(group.tiers) ? group.tiers : [];
+        badges.innerHTML = usageTierPills(tiers);
       }}
-
-      const tiers = Array.isArray(group.tiers) ? group.tiers : [];
-      if (tiers.length === 0) {{
-        badges.innerHTML = "";
-        renderedAny = true;
-        continue;
+      if (Array.isArray(group.keyUsages) && group.keyUsages.length > 0 && badges.innerHTML) {{
+        badges.style.cursor = "help";
+        badges.onmouseenter = () => showUsageTooltip(badges, slug, group);
+        badges.onmouseleave = hideUsageTooltip;
+        if (usageTooltipSlug === slug) showUsageTooltip(badges, slug, group);
+      }} else {{
+        badges.style.cursor = "";
+        badges.onmouseenter = null;
+        badges.onmouseleave = null;
+        if (usageTooltipSlug === slug) hideUsageTooltip();
       }}
-      badges.innerHTML = tiers.map((tier) => {{
-        const util = typeof tier.utilization === "number" ? tier.utilization : null;
-        const style = pillStyle(palette(util));
-        const label = tierLabel(tier.name);
-        const utilText = typeof util === "number" ? Math.round(util) + "%" : "—";
-        const countdown = countdownStr(tier.resetsAt);
-        const countdownText = countdown ? ` · ${{countdown}}` : "";
-        return `<span style="${{style}}">${{escapeHtml(label)}} ${{utilText}}${{countdownText}}</span>`;
-      }}).join("");
       renderedAny = true;
     }}
     return renderedAny || bySlug.size === 0;
+  }};
+  const renderGroupUsage = (data) => {{
+    const groups = data && data.groups && typeof data.groups === "object" ? data.groups : null;
+    if (!groups) {{
+      document.querySelectorAll("[data-cch-group-usage]").forEach((el) => el.remove());
+      return true;
+    }}
+
+    const renderedSlugs = new Set();
+    let renderedAny = false;
+    for (const [slug, entry] of Object.entries(groups)) {{
+      if (!slug || !entry || typeof entry !== "object") continue;
+      const header = findHeaderForSlug(slug);
+      if (!header) continue;
+
+      document.querySelectorAll(`span[data-cch-group-usage="${{slug}}"]`).forEach((el) => {{
+        if (el.parentElement !== header) el.remove();
+      }});
+
+      let badges = header.querySelector(`:scope > span[data-cch-group-usage="${{slug}}"]`);
+      if (!badges) {{
+        badges = document.createElement("span");
+        badges.dataset.cchGroupUsage = slug;
+        badges.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-left:8px;font-size:12px;color:var(--muted-foreground);";
+        header.appendChild(badges);
+      }}
+
+      const style = pillStyle(usageBadgeColors);
+      const pills = [
+        `<span style="${{style}}">${{compactNumber(entry.requestCount)}} 次</span>`,
+        `<span style="${{style}}">${{tokensM(entry.totalTokens)}}</span>`,
+      ];
+      // The configured status group (opus) already shows weekly cost/quota
+      // pills; omit the compact cost tag there.
+      if (slug !== statusGroupSlug) {{
+        pills.push(`<span style="${{style}}">${{money(entry.costUsd)}}</span>`);
+      }}
+      badges.innerHTML = pills.join("");
+      renderedSlugs.add(slug);
+      renderedAny = true;
+    }}
+
+    document.querySelectorAll("[data-cch-group-usage]").forEach((el) => {{
+      if (!renderedSlugs.has(el.getAttribute("data-cch-group-usage"))) el.remove();
+    }});
+    return renderedAny || document.querySelector('a[href*="/status/"]') !== null;
   }};
   const loadConsumption = () => {{
     fetch(consumptionEndpoint, {{ cache: "no-store" }})
@@ -337,15 +459,23 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
       .then((body) => body && body.ok && scheduleRenderProviderUsage(body.data))
       .catch(() => {{}});
   }};
+  const loadGroupUsage = () => {{
+    fetch(groupUsageEndpoint, {{ cache: "no-store" }})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("group usage unavailable")))
+      .then((body) => body && body.ok && scheduleRenderGroupUsage(body.data))
+      .catch(() => {{}});
+  }};
   const startEnhancements = () => {{
     loadConsumption();
     loadLeaderboard();
     loadPriceCoefficients();
     loadProviderUsage();
+    loadGroupUsage();
     window.setInterval(loadConsumption, refreshMs);
     window.setInterval(loadLeaderboard, refreshMs);
     window.setInterval(loadPriceCoefficients, refreshMs);
     window.setInterval(loadProviderUsage, Math.min(refreshMs, 30000));
+    window.setInterval(loadGroupUsage, refreshMs);
     window.setInterval(() => {{
       if (lastProviderUsageData) renderProviderUsage(lastProviderUsageData);
     }}, 30000);

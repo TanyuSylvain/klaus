@@ -23,6 +23,11 @@ from cch_manage.leaderboard import (
     weekly_total_requests,
     weekly_total_used_usd,
 )
+from cch_manage.group_usage import (
+    build_group_usage_payload,
+    collect_provider_usage_stats,
+    provider_ids_by_status_slug,
+)
 from cch_manage.price_coefficients import extract_group_price_coefficients
 from cch_manage.provider_usage import ProviderUsageManager
 from cch_manage.quota import manage_provider_group_quota
@@ -58,6 +63,8 @@ class CchStatusFeature:
         self._leaderboard_cache_expires_at = 0.0
         self._price_coefficients_cache: dict[str, Any] | None = None
         self._price_coefficients_cache_expires_at = 0.0
+        self._group_usage_cache: dict[str, Any] | None = None
+        self._group_usage_cache_expires_at = 0.0
         self._public_status_cache: dict[str, _PublicStatusCacheEntry] = {}
         self._public_status_lock = Lock()
         self._auto_disabled_provider_ids: set[int] = set()
@@ -81,6 +88,7 @@ class CchStatusFeature:
             Route("/cch/status/weekly-leaderboard", self.weekly_leaderboard, methods=["GET"]),
             Route("/cch/status/weekly-user-consumption", self.weekly_user_consumption, methods=["GET"]),
             Route("/cch/status/group-price-coefficients", self.group_price_coefficients, methods=["GET"]),
+            Route("/cch/status/group-usage", self.group_usage, methods=["GET"]),
             Route("/cch/status/provider-usage", self.provider_usage, methods=["GET"]),
         ]
 
@@ -180,6 +188,17 @@ class CchStatusFeature:
             payload = await self.get_group_price_coefficients()
         except Exception as exc:
             LOGGER.exception("failed to build CCH group price coefficients")
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"ok": True, "data": payload})
+
+    async def group_usage(self, _: Request) -> JSONResponse:
+        try:
+            payload = await self.get_group_usage()
+        except Exception as exc:
+            LOGGER.exception("failed to build CCH group usage")
             return JSONResponse(
                 {"ok": False, "error": str(exc)},
                 status_code=502,
@@ -430,6 +449,54 @@ class CchStatusFeature:
         }
         self._price_coefficients_cache = payload
         self._price_coefficients_cache_expires_at = (
+            now_monotonic + max(1, self.config.cache_ttl_seconds)
+        )
+        return payload
+
+    async def get_group_usage(self) -> dict[str, Any]:
+        now_monotonic = time.monotonic()
+        if (
+            self._group_usage_cache is not None
+            and now_monotonic < self._group_usage_cache_expires_at
+        ):
+            return self._group_usage_cache
+
+        week_start, week_end = self._current_week_range()
+        tz = week_start.tzinfo
+        now = datetime.now(tz)
+        providers = await self._require_cch().list_providers()
+        public_status = await self._get_public_status_payload("include=groups")
+        raw_groups = public_status.get("groups")
+        public_status_groups = (
+            [group for group in raw_groups if isinstance(group, dict)]
+            if isinstance(raw_groups, list)
+            else []
+        )
+        ids_by_slug = provider_ids_by_status_slug(
+            providers,
+            public_status_groups,
+            self.config.status_group_provider_groups,
+        )
+        provider_ids = sorted({
+            provider_id
+            for ids in ids_by_slug.values()
+            for provider_id in ids
+        })
+        stats_by_provider = await collect_provider_usage_stats(
+            self._require_cch(),
+            provider_ids,
+            int(week_start.timestamp() * 1000),
+            int(now.timestamp() * 1000),
+        )
+        payload = build_group_usage_payload(
+            ids_by_slug,
+            stats_by_provider,
+            week_start,
+            week_end,
+            datetime.now(ZoneInfo(self.config.timezone)),
+        )
+        self._group_usage_cache = payload
+        self._group_usage_cache_expires_at = (
             now_monotonic + max(1, self.config.cache_ttl_seconds)
         )
         return payload

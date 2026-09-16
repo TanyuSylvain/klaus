@@ -467,6 +467,7 @@ class ProviderUsageManager:
         for monitor in self.monitors:
             display_snapshots: list[UsageSnapshot] = []
             display_weights: list[float] = []
+            key_usages: list[dict[str, Any]] = []
             stale_any = False
             force_flags: list[bool | None] = []
             soonest_state: MonitorRuntimeState | None = None
@@ -478,6 +479,7 @@ class ProviderUsageManager:
                     soonest_state = state
                 if stale or (state.current is not None and not state.current.success):
                     stale_any = True
+                key_usages.append(self._public_key_usage(snapshot, stale))
                 if snapshot is not None and snapshot.success:
                     display_snapshots.append(snapshot)
                     display_weights.append(key.weight)
@@ -516,6 +518,7 @@ class ProviderUsageManager:
                     "success": not failed,
                     "stale": (not failed) and stale_any,
                     "tiers": snapshot.to_public_tiers() if snapshot else [],
+                    "keyUsages": key_usages,
                     "maxUtilization": (
                         round(snapshot.max_utilization, 2) if snapshot else None
                     ),
@@ -529,6 +532,25 @@ class ProviderUsageManager:
                 }
             )
         return {"groups": groups}
+
+    @staticmethod
+    def _public_key_usage(
+        snapshot: UsageSnapshot | None,
+        stale: bool,
+    ) -> dict[str, Any]:
+        if snapshot is not None and snapshot.success:
+            return {
+                "success": True,
+                "stale": stale,
+                "tiers": snapshot.to_public_tiers(),
+                "error": None,
+            }
+        return {
+            "success": False,
+            "stale": False,
+            "tiers": [],
+            "error": PUBLIC_ERROR_MESSAGE,
+        }
 
     @staticmethod
     def _display_snapshot(state: MonitorRuntimeState) -> tuple[UsageSnapshot | None, bool]:

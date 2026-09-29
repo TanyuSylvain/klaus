@@ -240,6 +240,7 @@ def test_status_script_includes_the_rank_table_control():
     assert ">模型</span>" in html
     assert "请求数" in html
     assert "Token数" in html
+    assert "tokensM(row.tokenCount)" in html
     assert "消耗金额" in html
     assert "排行榜暂时不可用" in html
     assert 'panel.style.gridRow = "3"' in html

@@ -200,6 +200,7 @@ def model_price_client_script() -> str:
   const formatRankCell = (row, key) => {
     if (key === "name") return escapeHtml(row.name || "");
     if (key === "costUsd") return money(row.costUsd);
+    if (key === "tokenCount") return tokensM(row.tokenCount);
     return compactNumber(row[key]);
   };
   const paintRankSwitch = () => {

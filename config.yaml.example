@@ -66,6 +66,12 @@ providers:
 #   model_prices:
 #     database_url: "postgresql://llm_proxy:password@127.0.0.1:5432/llm_proxy"
 #     update_interval_seconds: 21600
+#   # Weekly user and model rankings for the status-page 排行榜 panel. The page
+#   # reads this database; a background task refreshes it from CCH on the
+#   # interval below. Omit the block to leave the rank panel unavailable.
+#   rankings:
+#     database_url: "postgresql://llm_proxy:password@127.0.0.1:5432/llm_proxy"
+#     update_interval_seconds: 21600
 #   # Enables the cached weekly user usage data used by:
 #   #   /cch/status/weekly-leaderboard
 #   #   /cch/status/weekly-user-consumption?apiKey=<user-api-key>

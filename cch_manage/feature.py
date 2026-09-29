@@ -29,6 +29,8 @@ from cch_manage.group_usage import (
 )
 from cch_manage.model_price_store import PostgresModelPriceStore
 from cch_manage.model_prices import build_model_price_response, sync_model_prices
+from cch_manage.rank_store import PostgresRankStore
+from cch_manage.rankings import build_rank_response, sync_rankings
 from cch_manage.price_coefficients import (
     extract_group_price_coefficients,
     unavailable_status_slugs,
@@ -84,6 +86,12 @@ class CchStatusFeature:
         self._model_price_task: asyncio.Task[None] | None = None
         if config.model_prices is not None:
             self._model_price_store = PostgresModelPriceStore(config.model_prices.database_url)
+        self._rankings_cache: dict[str, Any] | None = None
+        self._rankings_cache_expires_at = 0.0
+        self._rank_store: PostgresRankStore | None = None
+        self._rank_task: asyncio.Task[None] | None = None
+        if config.rankings is not None:
+            self._rank_store = PostgresRankStore(config.rankings.database_url)
         self._public_status_cache: dict[str, _PublicStatusCacheEntry] = {}
         self._public_status_lock = Lock()
         self._auto_disabled_provider_ids: dict[str, set[int]] = {
@@ -112,6 +120,7 @@ class CchStatusFeature:
             Route("/cch/status/group-usage", self.group_usage, methods=["GET"]),
             Route("/cch/status/provider-usage", self.provider_usage, methods=["GET"]),
             Route("/cch/status/model-prices", self.model_prices, methods=["GET"]),
+            Route("/cch/status/rankings", self.rankings, methods=["GET"]),
         ]
 
     async def start(self, client_kwargs: dict[str, Any]) -> None:
@@ -145,6 +154,25 @@ class CchStatusFeature:
                     else 0
                 )
                 LOGGER.info("CCH model price sync started interval_seconds=%s", interval)
+        if self._rank_store is not None:
+            try:
+                await self._rank_store.open()
+                await self._rank_store.ensure_schema()
+            except Exception:
+                LOGGER.exception("CCH rank store unavailable; rank table stays empty")
+                await self._rank_store.close()
+                self._rank_store = None
+            else:
+                self._rank_task = asyncio.create_task(
+                    self._rank_sync_loop(),
+                    name="cch-rank-sync",
+                )
+                interval = (
+                    self.config.rankings.update_interval_seconds
+                    if self.config.rankings is not None
+                    else 0
+                )
+                LOGGER.info("CCH rank sync started interval_seconds=%s", interval)
 
     async def warmup(self) -> None:
         if not self.config.weekly_leaderboard_enabled:
@@ -167,7 +195,7 @@ class CchStatusFeature:
         )
 
     async def aclose(self) -> None:
-        for task in (self._usage_task, self._model_price_task):
+        for task in (self._usage_task, self._model_price_task, self._rank_task):
             if task is None:
                 continue
             task.cancel()
@@ -177,9 +205,13 @@ class CchStatusFeature:
                 pass
         self._usage_task = None
         self._model_price_task = None
+        self._rank_task = None
         if self._model_price_store is not None:
             await self._model_price_store.close()
             self._model_price_store = None
+        if self._rank_store is not None:
+            await self._rank_store.close()
+            self._rank_store = None
         if self.client is not None:
             await self.client.aclose()
 
@@ -246,6 +278,17 @@ class CchStatusFeature:
             payload = await self.get_model_prices()
         except Exception as exc:
             LOGGER.exception("failed to build CCH model prices")
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"ok": True, "data": payload})
+
+    async def rankings(self, _: Request) -> JSONResponse:
+        try:
+            payload = await self.get_rankings()
+        except Exception as exc:
+            LOGGER.exception("failed to build CCH rankings")
             return JSONResponse(
                 {"ok": False, "error": str(exc)},
                 status_code=502,
@@ -541,6 +584,29 @@ class CchStatusFeature:
         )
         return payload
 
+    async def get_rankings(self) -> dict[str, Any]:
+        if self._rank_store is None:
+            raise RuntimeError("CCH rank storage is not configured")
+
+        now_monotonic = time.monotonic()
+        if (
+            self._rankings_cache is not None
+            and now_monotonic < self._rankings_cache_expires_at
+        ):
+            return self._rankings_cache
+
+        rows, meta = await self._rank_store.list_snapshot()
+        payload = build_rank_response(
+            rows,
+            meta,
+            generated_at=datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
+        )
+        self._rankings_cache = payload
+        self._rankings_cache_expires_at = (
+            now_monotonic + max(1, self.config.cache_ttl_seconds)
+        )
+        return payload
+
     async def get_group_usage(self) -> dict[str, Any]:
         now_monotonic = time.monotonic()
         if (
@@ -780,6 +846,42 @@ class CchStatusFeature:
         )
         self._model_prices_cache = None
         self._model_prices_cache_expires_at = 0.0
+
+    async def _rank_sync_loop(self) -> None:
+        await asyncio.sleep(1)
+        while True:
+            interval = (
+                self.config.rankings.update_interval_seconds
+                if self.config.rankings is not None
+                else _MODEL_PRICE_FAILURE_RETRY_SECONDS
+            )
+            delay = float(interval)
+            try:
+                await self._sync_rankings_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("CCH rank sync failed")
+                delay = float(min(_MODEL_PRICE_FAILURE_RETRY_SECONDS, interval))
+            await asyncio.sleep(delay)
+
+    async def _sync_rankings_once(self) -> None:
+        store = self._rank_store
+        if store is None:
+            return
+        week_start, week_end = self._current_week_range()
+        now = datetime.now(week_start.tzinfo)
+        row_count = await sync_rankings(
+            self._require_cch(),
+            store,
+            week_start=week_start,
+            week_end=week_end,
+            query_end=now,
+            updated_at=now,
+        )
+        self._rankings_cache = None
+        self._rankings_cache_expires_at = 0.0
+        LOGGER.info("CCH rank sync finished rows=%s", row_count)
 
     def _require_client(self) -> httpx.AsyncClient:
         if self.client is None:

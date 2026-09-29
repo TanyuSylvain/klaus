@@ -281,6 +281,65 @@ def test_get_dashboard_statistics_sends_time_range():
     assert seen["params"] == {"timeRange": "7days"}
 
 
+def test_list_users_follows_the_cursor():
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        if request.url.params.get("cursor") is None:
+            return _json_response(
+                {
+                    "items": [{"id": 1, "name": "ada"}, "skip"],
+                    "pageInfo": {"hasMore": True, "nextCursor": "c2", "limit": 100},
+                }
+            )
+        return _json_response(
+            {
+                "items": [{"id": 2, "name": "beau"}],
+                "pageInfo": {"hasMore": False, "nextCursor": None, "limit": 100},
+            }
+        )
+
+    cch, _ = _make_client(handler)
+
+    async def run() -> list[dict[str, Any]]:
+        return await cch.list_users()
+
+    assert asyncio.run(run()) == [{"id": 1, "name": "ada"}, {"id": 2, "name": "beau"}]
+    assert seen == [{"limit": "100"}, {"limit": "100", "cursor": "c2"}]
+
+
+def test_list_usage_models_reads_string_items():
+    cch, _ = _make_client(
+        lambda request: _json_response({"items": ["glm-5.3", "", 3, "k3"]})
+    )
+
+    async def run() -> list[str]:
+        return await cch.list_usage_models()
+
+    assert asyncio.run(run()) == ["glm-5.3", "k3"]
+
+
+def test_get_usage_log_stats_sends_user_and_model_filters():
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return _json_response({"totalRequests": 1, "totalTokens": 2, "totalCost": 0.5})
+
+    cch, _ = _make_client(handler)
+
+    async def run() -> None:
+        await cch.get_usage_log_stats(user_id=7, start_time_ms=1000, end_time_ms=2000)
+        await cch.get_usage_log_stats(model="glm-5.3", start_time_ms=1000, end_time_ms=2000)
+
+    asyncio.run(run())
+    assert seen == [
+        {"userId": "7", "startTime": "1000", "endTime": "2000"},
+        {"model": "glm-5.3", "startTime": "1000", "endTime": "2000"},
+    ]
+
+
 def test_get_usage_log_stats_sends_provider_and_window():
     seen: dict[str, Any] = {}
     payload = {"totalRequests": 20, "totalCost": 9.56, "totalTokens": 12009858}

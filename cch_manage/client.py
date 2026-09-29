@@ -139,21 +139,65 @@ class CchClient:
             raise RuntimeError("CCH dashboard statistics returned unexpected data shape")
         return body
 
+    async def list_users(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(50):
+            params: dict[str, Any] = {"limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await self._send("GET", "/api/v1/users", params=params)
+            self._raise_for_problem(response)
+
+            body = response.json()
+            page = body.get("items") if isinstance(body, dict) else None
+            if not isinstance(page, list):
+                raise RuntimeError("CCH users returned unexpected data shape")
+            items.extend(user for user in page if isinstance(user, dict))
+
+            page_info = body.get("pageInfo") if isinstance(body, dict) else None
+            if not isinstance(page_info, dict) or not page_info.get("hasMore"):
+                return items
+            next_cursor = page_info.get("nextCursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                return items
+            cursor = next_cursor
+        raise RuntimeError("CCH user list exceeded the page limit")
+
+    async def list_usage_models(self) -> list[str]:
+        response = await self._send("GET", "/api/v1/usage-logs/models")
+        self._raise_for_problem(response)
+
+        body = response.json()
+        items = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("CCH usage models returned unexpected data shape")
+        return [model for model in items if isinstance(model, str) and model]
+
     async def get_usage_log_stats(
         self,
         *,
-        provider_id: int,
-        start_time_ms: int,
-        end_time_ms: int,
+        provider_id: int | None = None,
+        user_id: int | None = None,
+        model: str | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if provider_id is not None:
+            params["providerId"] = provider_id
+        if user_id is not None:
+            params["userId"] = user_id
+        if model is not None:
+            params["model"] = model
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
         response = await self._send(
             "GET",
             "/api/v1/usage-logs/stats",
-            params={
-                "providerId": provider_id,
-                "startTime": start_time_ms,
-                "endTime": end_time_ms,
-            },
+            params=params,
         )
         self._raise_for_problem(response)
 

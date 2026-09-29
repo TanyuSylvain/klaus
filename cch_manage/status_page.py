@@ -9,6 +9,7 @@ ROOT_RELATIVE_ATTR_RE = re.compile(r'(?P<prefix>\b(?:href|src|action)=["\'])(?P<
 def model_price_client_script() -> str:
     return """
   const modelPricesEndpoint = window.location.origin + "/cch/status/model-prices";
+  const rankingsEndpoint = window.location.origin + "/cch/status/rankings";
   const widePriceQuery = window.matchMedia("(min-width: 960px)");
   const wideOpenColumns = "minmax(0, 6fr) minmax(0, 4fr)";
   const wideClosedColumns = "minmax(0, 6fr) minmax(0, 0fr)";
@@ -28,6 +29,11 @@ def model_price_client_script() -> str:
   let priceSort = {key: "", dir: "asc"};
   let priceObserver = null;
   let priceLayoutGeneration = 0;
+  let rankOpen = false;
+  let rankShowUsers = true;
+  let rankPayload = null;
+  let rankFailed = false;
+  let rankSort = {key: "costUsd", dir: "desc"};
 
   const findSortButton = () => {
     const icon = document.querySelector("svg.lucide-arrow-down-a-z");
@@ -156,6 +162,111 @@ def model_price_client_script() -> str:
         if (synced) synced.textContent = "";
       });
   };
+  const rankColumns = () => [
+    {key: "name", label: rankShowUsers ? "用户" : "模型", numeric: false},
+    {key: "requestCount", label: "请求数", numeric: true},
+    {key: "tokenCount", label: "Token数", numeric: true},
+    {key: "costUsd", label: "消耗金额", numeric: true},
+  ];
+  const rankRangeLabel = (payload) => {
+    if (!payload) return "";
+    const start = dateLabel(payload.weekStart);
+    const endDate = payload.weekEnd ? new Date(payload.weekEnd) : null;
+    if (endDate && !Number.isNaN(endDate.getTime())) endDate.setDate(endDate.getDate() - 1);
+    const end = dateLabel(endDate);
+    const range = start && end ? `${start}–${end}` : "";
+    const synced = priceSyncedLabel(payload.syncedAt);
+    if (range && synced) return `${range} · ${synced}`;
+    return range || synced;
+  };
+  const rankSortValue = (row, key) => {
+    if (key === "name") return String(row.name || "");
+    const amount = Number(row[key]);
+    return Number.isFinite(amount) ? amount : null;
+  };
+  const compareRankRows = (left, right) => {
+    const leftValue = rankSortValue(left, rankSort.key);
+    const rightValue = rankSortValue(right, rankSort.key);
+    const leftEmpty = leftValue == null || leftValue === "";
+    const rightEmpty = rightValue == null || rightValue === "";
+    if (leftEmpty && rightEmpty) return 0;
+    if (leftEmpty) return 1;
+    if (rightEmpty) return -1;
+    const compared = typeof leftValue === "string"
+      ? leftValue.localeCompare(rightValue)
+      : leftValue - rightValue;
+    return rankSort.dir === "desc" ? -compared : compared;
+  };
+  const formatRankCell = (row, key) => {
+    if (key === "name") return escapeHtml(row.name || "");
+    if (key === "costUsd") return money(row.costUsd);
+    return compactNumber(row[key]);
+  };
+  const paintRankSwitch = () => {
+    const button = document.getElementById("cch-rank-scope");
+    if (!button) return;
+    button.setAttribute("aria-checked", rankShowUsers ? "false" : "true");
+    const userSide = button.querySelector("[data-rank-side='user']");
+    const modelSide = button.querySelector("[data-rank-side='model']");
+    if (userSide) userSide.style.cssText = rankShowUsers ? priceSwitchSelectedStyle : priceSwitchIdleStyle;
+    if (modelSide) modelSide.style.cssText = rankShowUsers ? priceSwitchIdleStyle : priceSwitchSelectedStyle;
+  };
+  const renderRankTable = () => {
+    const body = document.getElementById("cch-rank-body");
+    const synced = document.getElementById("cch-rank-synced");
+    if (!body || !rankPayload) return;
+    if (synced) synced.textContent = rankRangeLabel(rankPayload);
+    const source = rankShowUsers ? rankPayload.users : rankPayload.models;
+    const entries = Array.isArray(source) ? source.slice() : [];
+    entries.sort(compareRankRows);
+    const columns = rankColumns();
+    const head = columns.map((column) => {
+      const arrow = rankSort.key === column.key ? (rankSort.dir === "asc" ? " ▲" : " ▼") : "";
+      const align = column.numeric ? "right" : "left";
+      return `<th style="text-align:${align};padding:10px 12px;white-space:nowrap;font-weight:600;border-bottom:1px solid hsl(var(--border) / .7)"><button type="button" data-rank-sort="${column.key}" style="all:unset;cursor:pointer">${escapeHtml(column.label)}${arrow}</button></th>`;
+    }).join("");
+    const rows = entries.map((entry) => {
+      const cells = columns.map((column) => {
+        const align = column.numeric ? "right" : "left";
+        const weight = column.key === "name" ? "font-weight:600;" : "font-variant-numeric:tabular-nums;";
+        return `<td style="padding:10px 12px;text-align:${align};white-space:nowrap;${weight}">${formatRankCell(entry, column.key)}</td>`;
+      }).join("");
+      return `<tr>${cells}</tr>`;
+    }).join("");
+    const empty = entries.length === 0
+      ? `<tr><td colspan="${columns.length}" style="padding:10px 12px;color:var(--muted-foreground)">本周暂无数据</td></tr>`
+      : "";
+    body.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:0.875rem;line-height:1.4;color:var(--foreground)"><thead><tr>${head}</tr></thead><tbody>${rows}${empty}</tbody></table>`;
+    body.querySelectorAll("[data-rank-sort]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const key = button.getAttribute("data-rank-sort") || "";
+        if (rankSort.key === key) rankSort.dir = rankSort.dir === "asc" ? "desc" : "asc";
+        else rankSort = {key, dir: "asc"};
+        renderRankTable();
+      });
+    });
+  };
+  const loadRanks = () => {
+    const body = document.getElementById("cch-rank-body");
+    if (body) body.textContent = "加载中";
+    fetch(rankingsEndpoint, {cache: "no-store"})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("rankings unavailable")))
+      .then((payload) => {
+        const data = payload && payload.ok ? payload.data : null;
+        if (!data || !data.syncedAt) throw new Error("rankings unavailable");
+        rankPayload = data;
+        rankFailed = false;
+        renderRankTable();
+      })
+      .catch(() => {
+        rankPayload = null;
+        rankFailed = true;
+        const failedBody = document.getElementById("cch-rank-body");
+        if (failedBody) failedBody.textContent = "排行榜暂时不可用";
+        const synced = document.getElementById("cch-rank-synced");
+        if (synced) synced.textContent = "";
+      });
+  };
   const clearWidePriceLayout = (shell) => {
     shell.style.display = "";
     shell.style.gridTemplateColumns = "";
@@ -197,10 +308,10 @@ def model_price_client_script() -> str:
   };
   let priceAnchorFrame = 0;
   const syncPricePanelToAnchor = () => {
-    const panel = document.getElementById("cch-model-price-panel");
+    const panel = document.getElementById(priceOpen ? "cch-model-price-panel" : "cch-rank-panel");
     const sortButton = findSortButton();
     const shell = sortButton ? findPriceShell(sortButton) : null;
-    if (!panel || !shell || !priceOpen || !widePriceQuery.matches || panel.hidden) return;
+    if (!panel || !shell || !(priceOpen || rankOpen) || !widePriceQuery.matches || panel.hidden) return;
     const groups = shell.querySelector(":scope > div.space-y-4");
     const anchor = findPriceAnchor();
     const anchorRect = anchor ? anchor.getBoundingClientRect() : null;
@@ -286,6 +397,25 @@ def model_price_client_script() -> str:
       sortButton.insertAdjacentElement("afterend", toggle);
     }
   };
+  const ensureRankToggle = (sortButton) => {
+    let toggle = document.getElementById("cch-rank-toggle");
+    if (!toggle) {
+      toggle = document.createElement("button");
+      toggle.id = "cch-rank-toggle";
+      toggle.type = "button";
+      toggle.textContent = "排行榜";
+      toggle.addEventListener("click", () => setRankOpenState(!rankOpen));
+    }
+    if (toggle.className !== sortButton.className) toggle.className = sortButton.className;
+    toggle.setAttribute("aria-pressed", rankOpen ? "true" : "false");
+    toggle.style.flex = "0 0 auto";
+    toggle.style.boxShadow = rankOpen ? "inset 0 0 0 1px currentColor" : "";
+    const priceToggle = document.getElementById("cch-model-price-toggle");
+    const anchor = priceToggle || sortButton;
+    if (toggle.previousElementSibling !== anchor) {
+      anchor.insertAdjacentElement("afterend", toggle);
+    }
+  };
   const ensurePriceToolbar = (sortButton) => {
     const toolbar = sortButton.parentElement;
     if (!toolbar) return;
@@ -318,15 +448,42 @@ def model_price_client_script() -> str:
     paintPriceSwitch();
     return panel;
   };
+  const ensureRankPanel = (shell) => {
+    let panel = document.getElementById("cch-rank-panel");
+    if (!panel) {
+      panel = document.createElement("aside");
+      panel.id = "cch-rank-panel";
+      panel.hidden = true;
+      panel.style.cssText = "min-width:0;box-sizing:border-box;overflow:hidden;border:1px solid hsl(var(--border) / .6);border-radius:16px;background:hsl(var(--card) / .72);color:var(--foreground);box-shadow:0 8px 24px rgb(0 0 0 / .06);backdrop-filter:blur(8px);";
+      panel.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex:0 0 auto;padding:14px 14px 10px;background:hsl(var(--card) / .94);border-bottom:1px solid hsl(var(--border) / .45)"><div style="min-width:0"><div style="font-size:1.125rem;font-weight:600">排行榜</div><div id="cch-rank-synced" style="margin-top:2px;font-size:0.75rem;color:var(--muted-foreground)"></div></div><button type="button" id="cch-rank-scope" role="switch" aria-checked="false" aria-label="在用户和模型之间切换" style="display:inline-flex;flex:0 0 auto;align-items:center;gap:2px;border:1px solid #d4d4d8;border-radius:999px;padding:2px;background:#f3f4f6;color:#18181b;font-size:0.875rem;line-height:1.25;cursor:pointer;white-space:nowrap"><span data-rank-side="user" style="${priceSwitchSelectedStyle}">用户</span><span data-rank-side="model" style="${priceSwitchIdleStyle}">模型</span></button></div><div id="cch-rank-body" style="flex:1;min-height:0;overflow:auto;padding:10px 12px 16px;font-size:0.875rem;color:var(--muted-foreground)"></div>`;
+      const scope = panel.querySelector("#cch-rank-scope");
+      if (scope) {
+        scope.addEventListener("click", () => {
+          rankShowUsers = !rankShowUsers;
+          paintRankSwitch();
+          if (rankPayload) renderRankTable();
+        });
+      }
+    }
+    if (panel.parentElement !== shell) shell.appendChild(panel);
+    paintRankSwitch();
+    return panel;
+  };
+  const activeSidePanel = (pricePanel, rankPanel) => priceOpen ? pricePanel : rankPanel;
   const ensurePriceChrome = (restore) => {
     const sortButton = findSortButton();
     if (!sortButton) return;
     const shell = findPriceShell(sortButton);
     if (!shell) return;
     ensurePriceToggle(sortButton);
+    ensureRankToggle(sortButton);
     ensurePriceToolbar(sortButton);
-    const panel = ensurePricePanel(shell);
-    if (!restore || priceAnimating || !priceOpen) return;
+    const pricePanel = ensurePricePanel(shell);
+    const rankPanel = ensureRankPanel(shell);
+    if (!restore || priceAnimating || (!priceOpen && !rankOpen)) return;
+    const panel = activeSidePanel(pricePanel, rankPanel);
+    const other = panel === pricePanel ? rankPanel : pricePanel;
+    setPricePanelHidden(other, true);
     setPricePanelHidden(panel, false);
     if (widePriceQuery.matches) {
       applyWidePriceLayout(shell, panel, wideOpenColumns, false);
@@ -340,14 +497,15 @@ def model_price_client_script() -> str:
     panel.style.opacity = "1";
     panel.style.overflow = "hidden";
   };
-  const animatePriceLayout = () => {
+  const animateSideLayout = (kind) => {
     const generation = ++priceLayoutGeneration;
     const stillCurrent = () => generation === priceLayoutGeneration;
+    const isOpen = () => kind === "rank" ? rankOpen : priceOpen;
     priceAnimating = true;
     ensurePriceChrome(false);
     const sortButton = findSortButton();
     const shell = sortButton ? findPriceShell(sortButton) : null;
-    const panel = document.getElementById("cch-model-price-panel");
+    const panel = document.getElementById(kind === "rank" ? "cch-rank-panel" : "cch-model-price-panel");
     if (!shell || !panel) {
       priceAnimating = false;
       return;
@@ -359,7 +517,7 @@ def model_price_client_script() -> str:
         apply();
       }, 320);
     };
-    if (!priceOpen) {
+    if (!isOpen()) {
       panel.style.overflow = "hidden";
       panel.style.opacity = "0";
       if (widePriceQuery.matches && shell.style.display === "grid") {
@@ -369,7 +527,7 @@ def model_price_client_script() -> str:
         panel.style.maxHeight = "0px";
       }
       finishAnimation(() => {
-        if (priceOpen) return;
+        if (isOpen() || priceOpen || rankOpen) return;
         setPricePanelHidden(panel, true);
         clearWidePriceLayout(shell);
         releasePricePanelPin(panel);
@@ -379,6 +537,8 @@ def model_price_client_script() -> str:
       });
       return;
     }
+    const other = document.getElementById(kind === "rank" ? "cch-model-price-panel" : "cch-rank-panel");
+    if (other) setPricePanelHidden(other, true);
     setPricePanelHidden(panel, false);
     panel.style.opacity = "0";
     panel.style.overflow = "hidden";
@@ -388,11 +548,11 @@ def model_price_client_script() -> str:
       panel.style.transition = "max-height 320ms ease, opacity 250ms ease";
       panel.style.maxHeight = "0px";
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        if (!stillCurrent() || !priceOpen) return;
+        if (!stillCurrent() || !isOpen()) return;
         panel.style.maxHeight = "70vh";
         panel.style.opacity = "1";
         finishAnimation(() => {
-          if (priceOpen) panel.style.overflow = "hidden";
+          if (isOpen()) panel.style.overflow = "hidden";
         });
       }));
       return;
@@ -400,20 +560,62 @@ def model_price_client_script() -> str:
     panel.style.transition = "opacity 250ms ease";
     applyWidePriceLayout(shell, panel, wideClosedColumns, false);
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (!stillCurrent() || !priceOpen) return;
+      if (!stillCurrent() || !isOpen()) return;
       applyWidePriceLayout(shell, panel, wideOpenColumns, true);
       panel.style.opacity = "1";
       finishAnimation(() => {
-        if (priceOpen && widePriceQuery.matches) pinPricePanel(shell, panel);
+        if (isOpen() && widePriceQuery.matches) pinPricePanel(shell, panel);
       });
     }));
   };
+  const showSideImmediately = (kind) => {
+    priceLayoutGeneration += 1;
+    priceAnimating = false;
+    priceOpen = kind === "price";
+    rankOpen = kind === "rank";
+    ensurePriceChrome(false);
+    const sortButton = findSortButton();
+    const shell = sortButton ? findPriceShell(sortButton) : null;
+    const pricePanel = document.getElementById("cch-model-price-panel");
+    const rankPanel = document.getElementById("cch-rank-panel");
+    const panel = kind === "rank" ? rankPanel : pricePanel;
+    const other = kind === "rank" ? pricePanel : rankPanel;
+    if (!shell || !panel) return;
+    if (other) setPricePanelHidden(other, true);
+    setPricePanelHidden(panel, false);
+    panel.style.opacity = "1";
+    panel.style.overflow = "hidden";
+    if (widePriceQuery.matches) {
+      applyWidePriceLayout(shell, panel, wideOpenColumns, false);
+      return;
+    }
+    clearWidePriceLayout(shell);
+    releasePricePanelPin(panel);
+    panel.style.maxHeight = "70vh";
+  };
   const setPriceOpenState = (open) => {
+    if (open && rankOpen) {
+      showSideImmediately("price");
+      if (!pricePayload || priceFailed) loadModelPrices();
+      return;
+    }
     priceOpen = open;
     const toggle = document.getElementById("cch-model-price-toggle");
     if (toggle) toggle.setAttribute("aria-pressed", open ? "true" : "false");
-    animatePriceLayout();
+    animateSideLayout("price");
     if (open && (!pricePayload || priceFailed)) loadModelPrices();
+  };
+  const setRankOpenState = (open) => {
+    if (open && priceOpen) {
+      showSideImmediately("rank");
+      if (!rankPayload || rankFailed) loadRanks();
+      return;
+    }
+    rankOpen = open;
+    const toggle = document.getElementById("cch-rank-toggle");
+    if (toggle) toggle.setAttribute("aria-pressed", open ? "true" : "false");
+    animateSideLayout("rank");
+    if (open && (!rankPayload || rankFailed)) loadRanks();
   };
   const startModelPrices = () => {
     ensurePriceChrome(false);
@@ -432,7 +634,9 @@ def model_price_client_script() -> str:
     }
     if (typeof widePriceQuery.addEventListener === "function") {
       widePriceQuery.addEventListener("change", () => {
-        if (priceOpen && !priceAnimating) animatePriceLayout();
+        if ((priceOpen || rankOpen) && !priceAnimating) {
+          animateSideLayout(priceOpen ? "price" : "rank");
+        }
       });
     }
     window.addEventListener("scroll", requestPricePanelSync, {passive: true});

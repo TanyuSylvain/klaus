@@ -119,6 +119,28 @@ class QuotaGroupConfig:
 
 
 @dataclass(frozen=True)
+class ModelPriceConfig:
+    database_url: str
+    update_interval_seconds: int = 21600
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "ModelPriceConfig | None":
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("cch_status.model_prices must be a mapping")
+        database_url = str(raw.get("database_url", "")).strip()
+        if not database_url:
+            raise ValueError("cch_status.model_prices.database_url is required")
+        interval_raw = raw.get("update_interval_seconds", 21600)
+        if isinstance(interval_raw, bool) or not isinstance(interval_raw, int):
+            raise ValueError("cch_status.model_prices.update_interval_seconds must be an integer")
+        if interval_raw < 60:
+            raise ValueError("cch_status.model_prices.update_interval_seconds must be >= 60")
+        return cls(database_url=database_url, update_interval_seconds=interval_raw)
+
+
+@dataclass(frozen=True)
 class CchStatusConfig:
     base_url: str
     admin_token: str
@@ -132,6 +154,7 @@ class CchStatusConfig:
     quota_groups: tuple[QuotaGroupConfig, ...] = ()
     usage_monitors: list[UsageMonitorConfig] = field(default_factory=list)
     usage_query: UsageQueryConfig = field(default_factory=UsageQueryConfig)
+    model_prices: ModelPriceConfig | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "CchStatusConfig | None":
@@ -151,6 +174,7 @@ class CchStatusConfig:
             raw.get("usage_query") if isinstance(raw.get("usage_query"), dict) else None
         )
         usage_monitors = parse_usage_monitors(raw.get("usage_monitors"))
+        model_prices = ModelPriceConfig.from_dict(raw.get("model_prices"))
 
         return cls(
             base_url=base_url,
@@ -163,6 +187,7 @@ class CchStatusConfig:
             quota_groups=parse_quota_groups(raw.get("quota_groups")),
             usage_monitors=usage_monitors,
             usage_query=usage_query,
+            model_prices=model_prices,
         )
 
     def effective_card_provider_groups(self) -> dict[str, list[str]] | None:

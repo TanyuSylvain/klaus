@@ -10,6 +10,7 @@ dependencies = [
     "uvicorn>=0.32",
     "pyyaml>=6.0",
     "python-multipart>=0.0.18",
+    "asyncpg>=0.31.0",
 ]
 
 [dependency-groups]

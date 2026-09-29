@@ -6,6 +6,441 @@ from html import escape
 ROOT_RELATIVE_ATTR_RE = re.compile(r'(?P<prefix>\b(?:href|src|action)=["\'])(?P<url>/[^"\']*)')
 
 
+def model_price_client_script() -> str:
+    return """
+  const modelPricesEndpoint = window.location.origin + "/cch/status/model-prices";
+  const widePriceQuery = window.matchMedia("(min-width: 960px)");
+  const wideOpenColumns = "minmax(0, 6fr) minmax(0, 4fr)";
+  const wideClosedColumns = "minmax(0, 6fr) minmax(0, 0fr)";
+  const priceColumns = [
+    {key: "model", label: "模型", numeric: false},
+    {key: "inputPerM", label: "输入", unit: "/M", numeric: true},
+    {key: "outputPerM", label: "输出", unit: "/M", numeric: true},
+    {key: "cacheReadPerM", label: "缓存读", unit: "/M", numeric: true},
+    {key: "cacheWritePerM", label: "缓存写", unit: "/M", numeric: true},
+    {key: "perCall", label: "每次价格", numeric: true},
+  ];
+  let priceOpen = false;
+  let priceAnimating = false;
+  let showPriceCoeff = false;
+  let pricePayload = null;
+  let priceFailed = false;
+  let priceSort = {key: "", dir: "asc"};
+  let priceObserver = null;
+  let priceLayoutGeneration = 0;
+
+  const findSortButton = () => {
+    const icon = document.querySelector("svg.lucide-arrow-down-a-z");
+    const fromIcon = icon && icon.closest("button");
+    if (fromIcon) return fromIcon;
+    for (const button of document.querySelectorAll("button")) {
+      if ((button.textContent || "").trim() === "自定义排序") return button;
+    }
+    return null;
+  };
+  const findPriceShell = (sortButton) =>
+    sortButton.closest("div.mx-auto.flex.w-full.max-w-7xl.flex-col");
+  const formatPriceCell = (cell) => {
+    if (cell == null || cell === "") return "—";
+    if (typeof cell === "object") {
+      if (cell.min == null || cell.max == null || cell.min === "" || cell.max === "") return "—";
+      if (String(cell.min) === String(cell.max)) return "$" + escapeHtml(cell.min);
+      return "$" + escapeHtml(cell.min) + "–$" + escapeHtml(cell.max);
+    }
+    return "$" + escapeHtml(cell);
+  };
+  const priceSyncedLabel = (value) => {
+    const date = value ? new Date(value) : null;
+    if (!date || Number.isNaN(date.getTime())) return "";
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    return `更新于 ${date.getMonth() + 1}月${date.getDate()}日 ${hours}:${minutes}`;
+  };
+  const priceSortValue = (model, key) => {
+    if (key === "model") return String(model.model || "");
+    const source = showPriceCoeff ? model.adjusted : model.prices;
+    const cell = source ? source[key] : null;
+    if (showPriceCoeff) {
+      if (!cell || cell.min == null || cell.min === "") return null;
+      const adjusted = Number(cell.min);
+      return Number.isFinite(adjusted) ? adjusted : null;
+    }
+    if (cell == null || cell === "") return null;
+    const amount = Number(cell);
+    return Number.isFinite(amount) ? amount : null;
+  };
+  const comparePriceRows = (left, right) => {
+    if (!priceSort.key) return 0;
+    const leftValue = priceSortValue(left, priceSort.key);
+    const rightValue = priceSortValue(right, priceSort.key);
+    const leftEmpty = leftValue == null || leftValue === "";
+    const rightEmpty = rightValue == null || rightValue === "";
+    if (leftEmpty && rightEmpty) return 0;
+    if (leftEmpty) return 1;
+    if (rightEmpty) return -1;
+    const compared = typeof leftValue === "string"
+      ? leftValue.localeCompare(rightValue)
+      : leftValue - rightValue;
+    return priceSort.dir === "desc" ? -compared : compared;
+  };
+  const priceSwitchSelectedStyle = "display:inline-block;border-radius:999px;padding:3px 10px;background:#2563eb;color:#ffffff;font-weight:600;line-height:1.25;white-space:nowrap;";
+  const priceSwitchIdleStyle = "display:inline-block;border-radius:999px;padding:3px 10px;background:#e5e7eb;color:#3f3f46;font-weight:500;line-height:1.25;white-space:nowrap;";
+  const paintPriceSwitch = () => {
+    const button = document.getElementById("cch-model-price-coeff");
+    if (!button) return;
+    button.setAttribute("aria-checked", showPriceCoeff ? "true" : "false");
+    const off = button.querySelector("[data-price-side='off']");
+    const on = button.querySelector("[data-price-side='on']");
+    if (off) off.style.cssText = showPriceCoeff ? priceSwitchIdleStyle : priceSwitchSelectedStyle;
+    if (on) on.style.cssText = showPriceCoeff ? priceSwitchSelectedStyle : priceSwitchIdleStyle;
+  };
+  const renderPriceTable = () => {
+    const body = document.getElementById("cch-model-price-body");
+    const synced = document.getElementById("cch-model-price-synced");
+    if (!body || !pricePayload) return;
+    if (synced) synced.textContent = priceSyncedLabel(pricePayload.syncedAt);
+    const models = Array.isArray(pricePayload.models) ? pricePayload.models.slice() : [];
+    models.sort(comparePriceRows);
+    const head = priceColumns.map((column) => {
+      const arrow = priceSort.key === column.key ? (priceSort.dir === "asc" ? " ▲" : " ▼") : "";
+      const unit = column.unit
+        ? `<span style="color:var(--muted-foreground);font-weight:500">${column.unit}</span>`
+        : "";
+      const align = column.numeric ? "right" : "left";
+      return `<th style="text-align:${align};padding:10px 12px;white-space:nowrap;font-weight:600;border-bottom:1px solid hsl(var(--border) / .7)"><button type="button" data-price-sort="${column.key}" style="all:unset;cursor:pointer">${escapeHtml(column.label)}${unit}${arrow}</button></th>`;
+    }).join("");
+    const rows = models.map((model) => {
+      const cells = priceColumns.map((column) => {
+        if (column.key === "model") {
+          const groups = Array.isArray(model.groups)
+            ? model.groups.map((slug) => escapeHtml(slug)).join(" · ")
+            : "";
+          return `<td style="padding:10px 12px;vertical-align:top"><div style="font-weight:600">${escapeHtml(model.model)}</div><div style="color:var(--muted-foreground);font-size:0.75rem">${groups}</div></td>`;
+        }
+        const source = showPriceCoeff ? model.adjusted : model.prices;
+        const cell = source ? source[column.key] : null;
+        return `<td style="padding:10px 12px;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums">${formatPriceCell(cell)}</td>`;
+      }).join("");
+      return `<tr>${cells}</tr>`;
+    }).join("");
+    body.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:0.875rem;line-height:1.4;color:var(--foreground)"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+    body.querySelectorAll("[data-price-sort]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const key = button.getAttribute("data-price-sort") || "";
+        if (priceSort.key === key) priceSort.dir = priceSort.dir === "asc" ? "desc" : "asc";
+        else priceSort = {key, dir: "asc"};
+        renderPriceTable();
+      });
+    });
+  };
+  const loadModelPrices = () => {
+    const body = document.getElementById("cch-model-price-body");
+    if (body) body.textContent = "加载中";
+    fetch(modelPricesEndpoint, {cache: "no-store"})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("model prices unavailable")))
+      .then((payload) => {
+        const data = payload && payload.ok ? payload.data : null;
+        if (!data || !Array.isArray(data.models) || (data.models.length === 0 && !data.syncedAt)) {
+          throw new Error("model prices unavailable");
+        }
+        pricePayload = data;
+        priceFailed = false;
+        renderPriceTable();
+      })
+      .catch(() => {
+        pricePayload = null;
+        priceFailed = true;
+        const failedBody = document.getElementById("cch-model-price-body");
+        if (failedBody) failedBody.textContent = "价格暂时不可用";
+        const synced = document.getElementById("cch-model-price-synced");
+        if (synced) synced.textContent = "";
+      });
+  };
+  const clearWidePriceLayout = (shell) => {
+    shell.style.display = "";
+    shell.style.gridTemplateColumns = "";
+    shell.style.gridTemplateRows = "";
+    shell.style.columnGap = "";
+    shell.style.alignItems = "";
+    shell.style.transition = "";
+    shell.style.maxWidth = "";
+    shell.style.removeProperty("--cch-status-width");
+    for (const child of shell.children) {
+      child.style.gridColumn = "";
+      child.style.gridRow = "";
+    }
+  };
+  const setPricePanelHidden = (panel, hidden) => {
+    panel.hidden = hidden;
+    panel.style.display = hidden ? "none" : "flex";
+    if (!hidden) panel.style.flexDirection = "column";
+  };
+  const releasePricePanelPin = (panel) => {
+    panel.style.gridColumn = "";
+    panel.style.gridRow = "";
+    panel.style.position = "";
+    panel.style.top = "";
+    panel.style.height = "";
+    panel.style.maxHeight = "";
+    panel.style.minHeight = "";
+    panel.style.marginTop = "";
+    panel.style.alignSelf = "";
+    panel.style.justifySelf = "";
+    panel.style.width = "";
+  };
+  const findPriceAnchor = () => {
+    const board = document.getElementById("cch-weekly-leaderboard");
+    const card = board && board.querySelector("article");
+    if (card) return card;
+    if (typeof findFirstGroupCard === "function") return findFirstGroupCard();
+    return null;
+  };
+  let priceAnchorFrame = 0;
+  const syncPricePanelToAnchor = () => {
+    const panel = document.getElementById("cch-model-price-panel");
+    const sortButton = findSortButton();
+    const shell = sortButton ? findPriceShell(sortButton) : null;
+    if (!panel || !shell || !priceOpen || !widePriceQuery.matches || panel.hidden) return;
+    const groups = shell.querySelector(":scope > div.space-y-4");
+    const anchor = findPriceAnchor();
+    const anchorRect = anchor ? anchor.getBoundingClientRect() : null;
+    const groupsRect = groups ? groups.getBoundingClientRect() : null;
+    const delta = anchorRect && groupsRect ? Math.max(0, anchorRect.top - groupsRect.top) : 0;
+    // margin-top drops the in-flow panel from the groups row onto the cards.
+    // Sticky top stays 0 so once the page scrolls, the panel rests on the
+    // viewport top instead of keeping that offset.
+    panel.style.marginTop = delta + "px";
+    panel.style.top = "0px";
+    const visibleTop = anchorRect ? Math.max(0, anchorRect.top) : 0;
+    const height = Math.max(window.innerHeight - visibleTop, 280);
+    panel.style.height = height + "px";
+    panel.style.maxHeight = height + "px";
+  };
+  const requestPricePanelSync = () => {
+    if (priceAnchorFrame) return;
+    priceAnchorFrame = window.requestAnimationFrame(() => {
+      priceAnchorFrame = 0;
+      syncPricePanelToAnchor();
+    });
+  };
+  const pinPricePanel = (shell, panel) => {
+    panel.style.position = "sticky";
+    panel.style.alignSelf = "start";
+    panel.style.justifySelf = "stretch";
+    panel.style.width = "100%";
+    panel.style.minHeight = "0";
+    panel.style.overflow = "hidden";
+    syncPricePanelToAnchor();
+  };
+  const applyWidePriceLayout = (shell, panel, columns, withTransition) => {
+    const shellStyle = window.getComputedStyle(shell);
+    const padX = (parseFloat(shellStyle.paddingLeft) || 0) + (parseFloat(shellStyle.paddingRight) || 0);
+    shell.style.setProperty("--cch-status-width", `calc(80rem - ${padX}px)`);
+    shell.style.display = "grid";
+    shell.style.alignItems = "start";
+    shell.style.gridTemplateRows = "auto auto auto";
+    const open = columns === wideOpenColumns;
+    shell.style.columnGap = open ? "20px" : "0px";
+    shell.style.transition = withTransition ? "grid-template-columns 320ms ease, max-width 320ms ease" : "none";
+    shell.style.gridTemplateColumns = columns;
+    shell.style.maxWidth = open
+      ? `calc(var(--cch-status-width) + 20px + var(--cch-status-width) * 4 / 6 + ${padX}px)`
+      : `calc(var(--cch-status-width) + ${padX}px)`;
+    const header = shell.querySelector(":scope > header");
+    const sortButton = findSortButton();
+    const toolbar = sortButton ? sortButton.parentElement : null;
+    const groups = shell.querySelector(":scope > div.space-y-4");
+    if (header) {
+      header.style.gridColumn = "1";
+      header.style.gridRow = "1";
+    }
+    if (toolbar && toolbar.parentElement === shell) {
+      toolbar.style.gridColumn = "1";
+      toolbar.style.gridRow = "2";
+    }
+    if (groups) {
+      groups.style.gridColumn = "1";
+      groups.style.gridRow = "3";
+    }
+    panel.style.gridColumn = "2";
+    // Sit in the groups row so the panel starts beside the leaderboard,
+    // not beside the page title. syncPricePanelToAnchor nudges it down to
+    // the cards themselves.
+    panel.style.gridRow = "3";
+    pinPricePanel(shell, panel);
+  };
+  const ensurePriceToggle = (sortButton) => {
+    let toggle = document.getElementById("cch-model-price-toggle");
+    if (!toggle) {
+      toggle = document.createElement("button");
+      toggle.id = "cch-model-price-toggle";
+      toggle.type = "button";
+      toggle.textContent = "模型价格表";
+      toggle.addEventListener("click", () => setPriceOpenState(!priceOpen));
+    }
+    if (toggle.className !== sortButton.className) toggle.className = sortButton.className;
+    toggle.setAttribute("aria-pressed", priceOpen ? "true" : "false");
+    toggle.style.flex = "0 0 auto";
+    toggle.style.boxShadow = priceOpen ? "inset 0 0 0 1px currentColor" : "";
+    if (toggle.previousElementSibling !== sortButton) {
+      sortButton.insertAdjacentElement("afterend", toggle);
+    }
+  };
+  const ensurePriceToolbar = (sortButton) => {
+    const toolbar = sortButton.parentElement;
+    if (!toolbar) return;
+    toolbar.style.justifyContent = "flex-start";
+    toolbar.style.columnGap = "8px";
+    const search = toolbar.querySelector(":scope > div.relative");
+    if (search) search.style.marginRight = "auto";
+  };
+  const ensurePricePanel = (shell) => {
+    let panel = document.getElementById("cch-model-price-panel");
+    if (!panel) {
+      panel = document.createElement("aside");
+      panel.id = "cch-model-price-panel";
+      panel.hidden = true;
+      panel.style.cssText = "min-width:0;box-sizing:border-box;overflow:hidden;border:1px solid hsl(var(--border) / .6);border-radius:16px;background:hsl(var(--card) / .72);color:var(--foreground);box-shadow:0 8px 24px rgb(0 0 0 / .06);backdrop-filter:blur(8px);";
+      panel.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex:0 0 auto;padding:14px 14px 10px;background:hsl(var(--card) / .94);border-bottom:1px solid hsl(var(--border) / .45)"><div style="min-width:0"><div style="font-size:1.125rem;font-weight:600">模型价格表</div><div id="cch-model-price-synced" style="margin-top:2px;font-size:0.75rem;color:var(--muted-foreground)"></div></div><button type="button" id="cch-model-price-coeff" role="switch" aria-checked="false" aria-label="在原价和实际价之间切换" style="display:inline-flex;flex:0 0 auto;align-items:center;gap:2px;border:1px solid #d4d4d8;border-radius:999px;padding:2px;background:#f3f4f6;color:#18181b;font-size:0.875rem;line-height:1.25;cursor:pointer;white-space:nowrap"><span data-price-side="off" style="${priceSwitchSelectedStyle}">原价</span><span data-price-side="on" style="${priceSwitchIdleStyle}">实际</span></button></div><div id="cch-model-price-body" style="flex:1;min-height:0;overflow:auto;padding:10px 12px 16px;font-size:0.875rem;color:var(--muted-foreground)"></div>`;
+      const coeff = panel.querySelector("#cch-model-price-coeff");
+      if (coeff) {
+        coeff.addEventListener("click", () => {
+          showPriceCoeff = !showPriceCoeff;
+          paintPriceSwitch();
+          if (pricePayload) renderPriceTable();
+        });
+      }
+    }
+    if (panel.parentElement !== shell) shell.appendChild(panel);
+    // getElementById only finds a connected node, so the first paint has to
+    // happen after the panel is in the document. The markup colors above
+    // cover the frame before this runs.
+    paintPriceSwitch();
+    return panel;
+  };
+  const ensurePriceChrome = (restore) => {
+    const sortButton = findSortButton();
+    if (!sortButton) return;
+    const shell = findPriceShell(sortButton);
+    if (!shell) return;
+    ensurePriceToggle(sortButton);
+    ensurePriceToolbar(sortButton);
+    const panel = ensurePricePanel(shell);
+    if (!restore || priceAnimating || !priceOpen) return;
+    setPricePanelHidden(panel, false);
+    if (widePriceQuery.matches) {
+      applyWidePriceLayout(shell, panel, wideOpenColumns, false);
+      panel.style.opacity = "1";
+      panel.style.overflow = "hidden";
+      return;
+    }
+    clearWidePriceLayout(shell);
+    releasePricePanelPin(panel);
+    panel.style.maxHeight = "70vh";
+    panel.style.opacity = "1";
+    panel.style.overflow = "hidden";
+  };
+  const animatePriceLayout = () => {
+    const generation = ++priceLayoutGeneration;
+    const stillCurrent = () => generation === priceLayoutGeneration;
+    priceAnimating = true;
+    ensurePriceChrome(false);
+    const sortButton = findSortButton();
+    const shell = sortButton ? findPriceShell(sortButton) : null;
+    const panel = document.getElementById("cch-model-price-panel");
+    if (!shell || !panel) {
+      priceAnimating = false;
+      return;
+    }
+    const finishAnimation = (apply) => {
+      window.setTimeout(() => {
+        if (!stillCurrent()) return;
+        priceAnimating = false;
+        apply();
+      }, 320);
+    };
+    if (!priceOpen) {
+      panel.style.overflow = "hidden";
+      panel.style.opacity = "0";
+      if (widePriceQuery.matches && shell.style.display === "grid") {
+        applyWidePriceLayout(shell, panel, wideClosedColumns, true);
+      } else {
+        panel.style.transition = "max-height 320ms ease, opacity 250ms ease";
+        panel.style.maxHeight = "0px";
+      }
+      finishAnimation(() => {
+        if (priceOpen) return;
+        setPricePanelHidden(panel, true);
+        clearWidePriceLayout(shell);
+        releasePricePanelPin(panel);
+        panel.style.opacity = "";
+        panel.style.overflow = "hidden";
+        panel.style.transition = "";
+      });
+      return;
+    }
+    setPricePanelHidden(panel, false);
+    panel.style.opacity = "0";
+    panel.style.overflow = "hidden";
+    if (!widePriceQuery.matches) {
+      clearWidePriceLayout(shell);
+      releasePricePanelPin(panel);
+      panel.style.transition = "max-height 320ms ease, opacity 250ms ease";
+      panel.style.maxHeight = "0px";
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (!stillCurrent() || !priceOpen) return;
+        panel.style.maxHeight = "70vh";
+        panel.style.opacity = "1";
+        finishAnimation(() => {
+          if (priceOpen) panel.style.overflow = "hidden";
+        });
+      }));
+      return;
+    }
+    panel.style.transition = "opacity 250ms ease";
+    applyWidePriceLayout(shell, panel, wideClosedColumns, false);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (!stillCurrent() || !priceOpen) return;
+      applyWidePriceLayout(shell, panel, wideOpenColumns, true);
+      panel.style.opacity = "1";
+      finishAnimation(() => {
+        if (priceOpen && widePriceQuery.matches) pinPricePanel(shell, panel);
+      });
+    }));
+  };
+  const setPriceOpenState = (open) => {
+    priceOpen = open;
+    const toggle = document.getElementById("cch-model-price-toggle");
+    if (toggle) toggle.setAttribute("aria-pressed", open ? "true" : "false");
+    animatePriceLayout();
+    if (open && (!pricePayload || priceFailed)) loadModelPrices();
+  };
+  const startModelPrices = () => {
+    ensurePriceChrome(false);
+    if (!priceObserver && document.body) {
+      priceObserver = new MutationObserver(() => {
+        if (priceObserver) priceObserver.disconnect();
+        try {
+          ensurePriceChrome(true);
+        } finally {
+          if (priceObserver && document.body) {
+            priceObserver.observe(document.body, {childList: true, subtree: true});
+          }
+        }
+      });
+      priceObserver.observe(document.body, {childList: true, subtree: true});
+    }
+    if (typeof widePriceQuery.addEventListener === "function") {
+      widePriceQuery.addEventListener("change", () => {
+        if (priceOpen && !priceAnimating) animatePriceLayout();
+      });
+    }
+    window.addEventListener("scroll", requestPricePanelSync, {passive: true});
+    window.addEventListener("resize", requestPricePanelSync);
+  };
+"""
+
+
 def inject_status_script(
     html: str,
     quota_status_slugs: list[str],
@@ -524,12 +959,14 @@ def inject_status_script(
       .then((body) => body && body.ok && scheduleRenderGroupUsage(body.data))
       .catch(() => {{}});
   }};
+{model_price_client_script()}
   const startEnhancements = () => {{
     loadConsumption();
     loadLeaderboard();
     loadPriceCoefficients();
     loadProviderUsage();
     loadGroupUsage();
+    startModelPrices();
     window.setInterval(loadConsumption, refreshMs);
     window.setInterval(loadLeaderboard, refreshMs);
     window.setInterval(loadPriceCoefficients, refreshMs);

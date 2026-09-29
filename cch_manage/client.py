@@ -59,6 +59,26 @@ class CchClient:
             raise RuntimeError("CCH public status returned unexpected data shape")
         return data, response.status_code
 
+    async def list_model_prices(
+        self,
+        *,
+        search: str,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        response = await self._send(
+            "GET",
+            "/api/v1/model-prices",
+            params={"search": search, "page": page, "pageSize": page_size},
+        )
+        self._raise_for_problem(response)
+
+        body = response.json()
+        items = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("CCH model prices returned unexpected data shape")
+        return body
+
     async def list_providers(self) -> list[dict[str, Any]]:
         response = await self._send("GET", "/api/v1/providers")
         self._raise_for_problem(response)

@@ -27,6 +27,8 @@ from cch_manage.group_usage import (
     collect_provider_usage_stats,
     provider_ids_by_status_slug,
 )
+from cch_manage.model_price_store import PostgresModelPriceStore
+from cch_manage.model_prices import build_model_price_response, sync_model_prices
 from cch_manage.price_coefficients import (
     extract_group_price_coefficients,
     unavailable_status_slugs,
@@ -44,6 +46,7 @@ from cch_manage.utils import (
 
 
 LOGGER = logging.getLogger("llm_proxy.cch_status")
+_MODEL_PRICE_FAILURE_RETRY_SECONDS = 300
 
 
 def _provider_ids(providers: list[dict[str, Any]]) -> list[int]:
@@ -75,6 +78,12 @@ class CchStatusFeature:
         self._price_coefficients_cache_expires_at = 0.0
         self._group_usage_cache: dict[str, Any] | None = None
         self._group_usage_cache_expires_at = 0.0
+        self._model_prices_cache: dict[str, Any] | None = None
+        self._model_prices_cache_expires_at = 0.0
+        self._model_price_store: PostgresModelPriceStore | None = None
+        self._model_price_task: asyncio.Task[None] | None = None
+        if config.model_prices is not None:
+            self._model_price_store = PostgresModelPriceStore(config.model_prices.database_url)
         self._public_status_cache: dict[str, _PublicStatusCacheEntry] = {}
         self._public_status_lock = Lock()
         self._auto_disabled_provider_ids: dict[str, set[int]] = {
@@ -102,6 +111,7 @@ class CchStatusFeature:
             Route("/cch/status/group-price-coefficients", self.group_price_coefficients, methods=["GET"]),
             Route("/cch/status/group-usage", self.group_usage, methods=["GET"]),
             Route("/cch/status/provider-usage", self.provider_usage, methods=["GET"]),
+            Route("/cch/status/model-prices", self.model_prices, methods=["GET"]),
         ]
 
     async def start(self, client_kwargs: dict[str, Any]) -> None:
@@ -116,6 +126,25 @@ class CchStatusFeature:
                 "CCH provider usage monitors started count=%s",
                 len(self.config.usage_monitors),
             )
+        if self._model_price_store is not None:
+            try:
+                await self._model_price_store.open()
+                await self._model_price_store.ensure_schema()
+            except Exception:
+                LOGGER.exception("CCH model price store unavailable; price table stays empty")
+                await self._model_price_store.close()
+                self._model_price_store = None
+            else:
+                self._model_price_task = asyncio.create_task(
+                    self._model_price_sync_loop(),
+                    name="cch-model-price-sync",
+                )
+                interval = (
+                    self.config.model_prices.update_interval_seconds
+                    if self.config.model_prices is not None
+                    else 0
+                )
+                LOGGER.info("CCH model price sync started interval_seconds=%s", interval)
 
     async def warmup(self) -> None:
         if not self.config.weekly_leaderboard_enabled:
@@ -138,13 +167,19 @@ class CchStatusFeature:
         )
 
     async def aclose(self) -> None:
-        if self._usage_task is not None:
-            self._usage_task.cancel()
+        for task in (self._usage_task, self._model_price_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._usage_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._usage_task = None
+        self._usage_task = None
+        self._model_price_task = None
+        if self._model_price_store is not None:
+            await self._model_price_store.close()
+            self._model_price_store = None
         if self.client is not None:
             await self.client.aclose()
 
@@ -200,6 +235,17 @@ class CchStatusFeature:
             payload = await self.get_group_price_coefficients()
         except Exception as exc:
             LOGGER.exception("failed to build CCH group price coefficients")
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=502,
+            )
+        return JSONResponse({"ok": True, "data": payload})
+
+    async def model_prices(self, _: Request) -> JSONResponse:
+        try:
+            payload = await self.get_model_prices()
+        except Exception as exc:
+            LOGGER.exception("failed to build CCH model prices")
             return JSONResponse(
                 {"ok": False, "error": str(exc)},
                 status_code=502,
@@ -453,6 +499,48 @@ class CchStatusFeature:
         )
         return payload
 
+    async def get_model_prices(self) -> dict[str, Any]:
+        if self._model_price_store is None:
+            raise RuntimeError("CCH model price storage is not configured")
+
+        now_monotonic = time.monotonic()
+        if (
+            self._model_prices_cache is not None
+            and now_monotonic < self._model_prices_cache_expires_at
+        ):
+            return self._model_prices_cache
+
+        stored_rows = await self._model_price_store.list_prices()
+        generated_at = datetime.now(ZoneInfo(self.config.timezone)).isoformat()
+        if not stored_rows:
+            payload: dict[str, Any] = {
+                "generatedAt": generated_at,
+                "syncedAt": None,
+                "models": [],
+            }
+        else:
+            providers = await self._require_cch().list_providers()
+            public_status = await self._get_public_status_payload("include=groups")
+            raw_groups = public_status.get("groups")
+            public_groups = (
+                [group for group in raw_groups if isinstance(group, dict)]
+                if isinstance(raw_groups, list)
+                else []
+            )
+            payload = build_model_price_response(
+                public_groups,
+                stored_rows,
+                providers,
+                self.config.effective_card_provider_groups(),
+                generated_at=generated_at,
+            )
+
+        self._model_prices_cache = payload
+        self._model_prices_cache_expires_at = (
+            now_monotonic + max(1, self.config.cache_ttl_seconds)
+        )
+        return payload
+
     async def get_group_usage(self) -> dict[str, Any]:
         now_monotonic = time.monotonic()
         if (
@@ -656,6 +744,42 @@ class CchStatusFeature:
             # Cap the sleep so cancellation stays responsive and a clock-skewed
             # deadline cannot park the loop indefinitely.
             await asyncio.sleep(min(max(delay, 1.0), 60.0))
+
+    async def _model_price_sync_loop(self) -> None:
+        await asyncio.sleep(1)
+        while True:
+            interval = (
+                self.config.model_prices.update_interval_seconds
+                if self.config.model_prices is not None
+                else _MODEL_PRICE_FAILURE_RETRY_SECONDS
+            )
+            delay = float(interval)
+            try:
+                await self._sync_model_prices_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("CCH model price sync failed")
+                delay = float(min(_MODEL_PRICE_FAILURE_RETRY_SECONDS, interval))
+            await asyncio.sleep(delay)
+
+    async def _sync_model_prices_once(self) -> None:
+        store = self._model_price_store
+        if store is None:
+            return
+        public_status = await self._get_public_status_payload("include=groups")
+        raw_groups = public_status.get("groups")
+        if not isinstance(raw_groups, list):
+            raise RuntimeError("CCH public status returned no groups")
+        public_groups = [group for group in raw_groups if isinstance(group, dict)]
+        await sync_model_prices(
+            self._require_cch(),
+            store,
+            public_groups,
+            updated_at=datetime.now(UTC),
+        )
+        self._model_prices_cache = None
+        self._model_prices_cache_expires_at = 0.0
 
     def _require_client(self) -> httpx.AsyncClient:
         if self.client is None:

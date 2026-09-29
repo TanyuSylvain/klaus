@@ -57,6 +57,15 @@ providers:
 #   locale: "zh-CN"
 #   timezone: "Asia/Shanghai"
 #   cache_ttl_seconds: 300
+#   # Local snapshot of the public status models' base prices. The status page
+#   # reads this database; a background task refreshes it from CCH on the
+#   # interval below. Omit the block to leave the price panel unavailable.
+#   # Create the database and role first:
+#   #   CREATE USER llm_proxy WITH PASSWORD '...';
+#   #   CREATE DATABASE llm_proxy OWNER llm_proxy;
+#   model_prices:
+#     database_url: "postgresql://llm_proxy:password@127.0.0.1:5432/llm_proxy"
+#     update_interval_seconds: 21600
 #   # Enables the cached weekly user usage data used by:
 #   #   /cch/status/weekly-leaderboard
 #   #   /cch/status/weekly-user-consumption?apiKey=<user-api-key>

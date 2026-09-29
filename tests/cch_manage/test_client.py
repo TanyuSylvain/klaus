@@ -58,6 +58,34 @@ def test_weekly_usage_decimal_validates_cost_weekly():
         weekly_usage_decimal({"costWeekly": {"current": "abc"}})
 
 
+def test_list_model_prices_sends_auth_and_reads_items():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/v1/model-prices"
+        assert request.url.params["search"] == "glm-5.3"
+        assert request.url.params["page"] == "1"
+        assert request.url.params["pageSize"] == "100"
+        assert request.headers["authorization"] == f"Bearer {TOKEN}"
+        assert request.headers["cookie"] == f"auth-token={TOKEN}"
+        return _json_response(
+            {
+                "items": [{"modelName": "glm-5.3", "priceData": {"mode": "chat"}}],
+                "page": 1,
+                "pageSize": 100,
+                "total": 1,
+                "totalPages": 1,
+            }
+        )
+
+    cch, _ = _make_client(handler)
+
+    async def run() -> None:
+        body = await cch.list_model_prices(search="glm-5.3")
+        assert body["items"][0]["modelName"] == "glm-5.3"
+
+    asyncio.run(run())
+
+
 def test_list_providers_unwraps_items_and_sends_auth():
     provider = {"id": 1, "name": "p", "isEnabled": True, "groupTag": "claude"}
 

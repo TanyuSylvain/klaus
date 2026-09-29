@@ -1,9 +1,33 @@
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
+from cch_manage.client import weekly_usage_decimal
 from cch_manage.utils import percent_float, provider_enabled
 
 SetProviderEnabled = Callable[[int, bool], Awaitable[bool]]
+
+
+def quota_usage_summary(
+    provider_ids: list[int],
+    usages_by_provider: dict[int, dict[str, Any]],
+    weekly_quota_usd: Decimal,
+) -> dict[str, Decimal]:
+    """Sum weekly spend for one cap.
+
+    usages_by_provider may hold other groups' providers. Only provider_ids
+    count toward this cap, so a shared limit-usage batch cannot double-count.
+    """
+    if weekly_quota_usd <= 0:
+        raise ValueError("weekly_quota_usd must be > 0")
+
+    used = Decimal("0")
+    for provider_id in provider_ids:
+        used += weekly_usage_decimal(usages_by_provider[provider_id])
+    return {
+        "used": used,
+        "remaining": weekly_quota_usd - used,
+        "usage_pct": used / weekly_quota_usd * Decimal("100"),
+    }
 
 
 async def manage_provider_group_quota(

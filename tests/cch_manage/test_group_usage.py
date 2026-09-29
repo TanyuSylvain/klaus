@@ -145,13 +145,16 @@ def test_collect_provider_usage_stats_skips_failures():
     assert stats[1]["requestCount"] == 10
 
 
-def test_inject_status_script_group_usage_refresh_and_opus_omits_cost():
-    html = inject_status_script("<body></body>", "opus", 300)
+def test_inject_status_script_group_usage_refresh_and_quota_slugs_omit_cost():
+    html = inject_status_script("<body></body>", ["opus", "glm"], 300)
     assert "/cch/status/group-usage" in html
     assert "次" in html
     assert " M" in html
     assert "setInterval(loadGroupUsage, refreshMs)" in html
-    assert "slug !== statusGroupSlug" in html
+    assert '["opus", "glm"]' in html
+    assert "quotaSlugSet.has(slug)" in html
+    assert "data-cch-weekly-quota" in html
+    assert "本周消费" in html
     assert html.count("Math.min(refreshMs, 30000)") == 1
     assert "pillStyle(usageBadgeColors)" in html
     assert "rgb(59 130 246 / .55)" in html

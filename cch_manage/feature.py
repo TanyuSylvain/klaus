@@ -4,7 +4,6 @@ import time
 from asyncio import Lock
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -13,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from cch_manage.client import CchClient, weekly_usage_decimal
+from cch_manage.client import CchClient
 from cch_manage.config import CchStatusConfig
 from cch_manage.leaderboard import (
     active_leaderboard_entries,
@@ -30,10 +29,9 @@ from cch_manage.group_usage import (
 )
 from cch_manage.price_coefficients import extract_group_price_coefficients
 from cch_manage.provider_usage import ProviderUsageManager
-from cch_manage.quota import manage_provider_group_quota
+from cch_manage.quota import manage_provider_group_quota, quota_usage_summary
 from cch_manage.status_page import inject_status_script, rewrite_root_relative_urls
 from cch_manage.utils import (
-    decimal_from_any,
     money_float,
     percent_float,
     provider_groups,
@@ -43,6 +41,15 @@ from cch_manage.utils import (
 
 
 LOGGER = logging.getLogger("llm_proxy.cch_status")
+
+
+def _provider_ids(providers: list[dict[str, Any]]) -> list[int]:
+    ids: list[int] = []
+    for provider in providers:
+        provider_id = provider.get("id")
+        if isinstance(provider_id, int) and not isinstance(provider_id, bool):
+            ids.append(provider_id)
+    return ids
 
 
 @dataclass(frozen=True)
@@ -67,14 +74,16 @@ class CchStatusFeature:
         self._group_usage_cache_expires_at = 0.0
         self._public_status_cache: dict[str, _PublicStatusCacheEntry] = {}
         self._public_status_lock = Lock()
-        self._auto_disabled_provider_ids: set[int] = set()
+        self._auto_disabled_provider_ids: dict[str, set[int]] = {
+            group.provider_group: set() for group in config.quota_groups
+        }
         self._usage_manager: ProviderUsageManager | None = None
         self._usage_task: asyncio.Task[None] | None = None
         if config.usage_monitors:
             self._usage_manager = ProviderUsageManager(
                 config.usage_monitors,
                 config.usage_query,
-                status_group_provider_groups=config.status_group_provider_groups,
+                status_group_provider_groups=config.effective_card_provider_groups(),
             )
 
     def routes(self) -> list[Route]:
@@ -299,7 +308,7 @@ class CchStatusFeature:
         return HTMLResponse(
             inject_status_script(
                 html,
-                self.config.status_group_slug,
+                [group.status_slug for group in self.config.quota_groups],
                 self.config.cache_ttl_seconds,
             ),
             headers={"cache-control": "no-store"},
@@ -311,32 +320,14 @@ class CchStatusFeature:
             return self._cache
 
         week_start, week_end = self._current_week_range()
-        providers = await self._providers_in_group(self.config.provider_group)
-        provider_ids = [int(provider["id"]) for provider in providers if provider.get("id") is not None]
-
-        used = decimal_from_any(0)
-        if provider_ids:
-            usages = await self._require_cch().get_providers_limit_usage(provider_ids)
-            for provider_id in provider_ids:
-                used += weekly_usage_decimal(usages[provider_id])
-
-        quota = self.config.weekly_quota_usd
-        remaining = quota - used if quota is not None else None
-        usage_pct = (used / quota * decimal_from_any(100)) if quota and quota > 0 else None
-        auto_manage = await self._manage_provider_group_quota(providers, usage_pct)
+        groups: list[dict[str, Any]] = []
+        if self.config.quota_groups:
+            groups = await self._build_quota_group_payloads()
 
         payload = {
             "weekStart": week_start.isoformat(),
             "weekEnd": week_end.isoformat(),
-            "providerGroup": self.config.provider_group,
-            "statusGroupSlug": self.config.status_group_slug,
-            "usedUsd": money_float(used),
-            "quotaUsd": money_float(quota),
-            "remainingUsd": money_float(remaining),
-            "usagePct": percent_float(usage_pct),
-            "providerIds": provider_ids,
-            "source": "providerLimitUsage",
-            "autoManageProviderGroupQuota": auto_manage,
+            "groups": groups,
             "weeklyLeaderboardEnabled": self.config.weekly_leaderboard_enabled,
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }
@@ -441,7 +432,7 @@ class CchStatusFeature:
         groups = extract_group_price_coefficients(
             providers,
             public_status_groups,
-            self.config.status_group_provider_groups,
+            self.config.effective_card_provider_groups(),
         )
         payload = {
             "groups": groups,
@@ -475,7 +466,7 @@ class CchStatusFeature:
         ids_by_slug = provider_ids_by_status_slug(
             providers,
             public_status_groups,
-            self.config.status_group_provider_groups,
+            self.config.effective_card_provider_groups(),
         )
         provider_ids = sorted({
             provider_id
@@ -559,20 +550,60 @@ class CchStatusFeature:
         )
         return week_start, week_start + timedelta(days=7)
 
-    async def _manage_provider_group_quota(
-        self,
-        providers: list[dict[str, Any]],
-        usage_pct: Decimal | None,
-    ) -> dict[str, Any]:
-        return await manage_provider_group_quota(
-            providers,
-            usage_pct,
-            enabled=self.config.auto_manage_provider_group_quota,
-            weekly_quota_usd=self.config.weekly_quota_usd,
-            threshold_pct=self.config.auto_disable_threshold_pct,
-            auto_disabled_provider_ids=self._auto_disabled_provider_ids,
-            set_provider_enabled=self._set_provider_enabled,
-        )
+    async def _build_quota_group_payloads(self) -> list[dict[str, Any]]:
+        providers = await self._require_cch().list_providers()
+        providers_by_group: dict[str, list[dict[str, Any]]] = {}
+        provider_ids_by_group: dict[str, list[int]] = {}
+        all_ids: list[int] = []
+        seen_ids: set[int] = set()
+        for group in self.config.quota_groups:
+            matched = [
+                provider
+                for provider in providers
+                if group.provider_group in provider_groups(provider)
+            ]
+            providers_by_group[group.provider_group] = matched
+            ids = _provider_ids(matched)
+            provider_ids_by_group[group.provider_group] = ids
+            for provider_id in ids:
+                if provider_id not in seen_ids:
+                    seen_ids.add(provider_id)
+                    all_ids.append(provider_id)
+
+        usages: dict[int, dict[str, Any]] = {}
+        if all_ids:
+            usages = await self._require_cch().get_providers_limit_usage(all_ids)
+
+        payloads: list[dict[str, Any]] = []
+        for group in self.config.quota_groups:
+            provider_ids = provider_ids_by_group[group.provider_group]
+            summary = quota_usage_summary(provider_ids, usages, group.weekly_quota_usd)
+            disabled_ids = self._auto_disabled_provider_ids.setdefault(
+                group.provider_group,
+                set(),
+            )
+            auto_manage = await manage_provider_group_quota(
+                providers_by_group[group.provider_group],
+                summary["usage_pct"],
+                enabled=group.auto_manage,
+                weekly_quota_usd=group.weekly_quota_usd,
+                threshold_pct=group.disable_at_pct,
+                auto_disabled_provider_ids=disabled_ids,
+                set_provider_enabled=self._set_provider_enabled,
+            )
+            payloads.append(
+                {
+                    "statusSlug": group.status_slug,
+                    "providerGroup": group.provider_group,
+                    "usedUsd": money_float(summary["used"]),
+                    "quotaUsd": money_float(group.weekly_quota_usd),
+                    "remainingUsd": money_float(summary["remaining"]),
+                    "usagePct": percent_float(summary["usage_pct"]),
+                    "providerIds": provider_ids,
+                    "autoManage": auto_manage,
+                }
+            )
+        return payloads
 
     async def _set_provider_enabled(self, provider_id: int, enabled: bool) -> bool:
         try:

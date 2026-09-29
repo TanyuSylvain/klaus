@@ -101,10 +101,18 @@ def main():
     cch_status_config = CchStatusConfig.from_dict(cfg.get("cch_status"))
     cch_status_feature = CchStatusFeature(cch_status_config) if cch_status_config is not None else None
     if cch_status_feature is not None:
+        quota_labels = [
+            (
+                f"{group.status_slug}->{group.provider_group}"
+                if group.status_slug != group.provider_group
+                else group.status_slug
+            )
+            for group in cch_status_config.quota_groups
+        ]
         LOGGER.info(
-            "CCH status enabled, upstream=%s, group=%s",
+            "CCH status enabled, upstream=%s, quota_groups=%s",
             cch_status_config.base_url,
-            cch_status_config.status_group_slug,
+            ", ".join(quota_labels) if quota_labels else "(none)",
         )
     else:
         LOGGER.info("CCH status disabled (no enabled cch_status config section)")

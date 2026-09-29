@@ -6,11 +6,16 @@ from html import escape
 ROOT_RELATIVE_ATTR_RE = re.compile(r'(?P<prefix>\b(?:href|src|action)=["\'])(?P<url>/[^"\']*)')
 
 
-def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: int) -> str:
+def inject_status_script(
+    html: str,
+    quota_status_slugs: list[str],
+    cache_ttl_seconds: int,
+) -> str:
     script = f"""
 <script>
 (() => {{
-  const statusGroupSlug = {json.dumps(status_group_slug)};
+  const quotaStatusSlugs = {json.dumps(list(quota_status_slugs))};
+  const quotaSlugSet = new Set(quotaStatusSlugs);
   const refreshMs = {max(1, cache_ttl_seconds) * 1000};
   const consumptionEndpoint = window.location.origin + "/cch/status/weekly-consumption";
   const leaderboardEndpoint = window.location.origin + "/cch/status/weekly-leaderboard";
@@ -154,15 +159,15 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
     tip.style.display = "block";
     positionUsageTooltip(anchor, tip);
   }};
-  const findGroupHeader = () => {{
-    const link = document.querySelector(`a[href$="/status/${{statusGroupSlug}}"]`);
-    if (!link) return null;
-    return link.closest("div.flex.items-center.gap-2") || link.parentElement;
-  }};
   const findFirstGroupCard = () => {{
-    const header = findGroupHeader();
-    if (!header) return null;
-    return header.closest("section") || header.closest('[class*="rounded"][class*="border"]');
+    const links = Array.from(document.querySelectorAll('a[href*="/status/"]'));
+    for (const link of links) {{
+      if (!String(link.textContent || "").trim()) continue;
+      const header = link.closest("div.flex.items-center.gap-2") || link.parentElement;
+      if (!header) continue;
+      return header.closest("section") || header.closest('[class*="rounded"][class*="border"]');
+    }}
+    return null;
   }};
   const scheduleRenderQuota = (data, attempts = 20) => {{
     if (renderQuota(data) || attempts <= 0) return;
@@ -245,23 +250,48 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
     return true;
   }};
   const renderQuota = (data) => {{
-    const header = findGroupHeader();
-    if (!header) return false;
-    let badge = document.getElementById("cch-weekly-consumption");
-    if (!badge) {{
-      badge = document.createElement("div");
-      badge.id = "cch-weekly-consumption";
-      badge.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-left:8px;font-size:12px;color:var(--muted-foreground);";
-      header.appendChild(badge);
+    const groups = Array.isArray(data && data.groups) ? data.groups : [];
+    if (groups.length === 0) {{
+      document.querySelectorAll("[data-cch-weekly-quota]").forEach((el) => el.remove());
+      return true;
     }}
-    const colors = palette(data.usagePct);
-    const style = pillStyle(colors);
-    badge.innerHTML = [
-      `<span style="${{style}}">本周消费 ${{money(data.usedUsd)}} / ${{money(data.quotaUsd)}}</span>`,
-      `<span style="${{style}}">${{percent(data.usagePct)}}</span>`,
-      `<span style="${{style}}">剩余 ${{money(data.remainingUsd)}}</span>`,
-    ].join("");
-    return true;
+
+    const renderedSlugs = new Set();
+    let missing = false;
+    for (const group of groups) {{
+      const slug = group && typeof group.statusSlug === "string" ? group.statusSlug : "";
+      if (!slug) continue;
+      const header = findHeaderForSlug(slug);
+      if (!header) {{
+        missing = true;
+        continue;
+      }}
+
+      document.querySelectorAll(`span[data-cch-weekly-quota="${{slug}}"]`).forEach((el) => {{
+        if (el.parentElement !== header) el.remove();
+      }});
+
+      let badges = header.querySelector(`:scope > span[data-cch-weekly-quota="${{slug}}"]`);
+      if (!badges) {{
+        badges = document.createElement("span");
+        badges.dataset.cchWeeklyQuota = slug;
+        badges.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-left:8px;font-size:12px;color:var(--muted-foreground);";
+        header.appendChild(badges);
+      }}
+      const colors = palette(group.usagePct);
+      const style = pillStyle(colors);
+      badges.innerHTML = [
+        `<span style="${{style}}">本周消费 ${{money(group.usedUsd)}} / ${{money(group.quotaUsd)}}</span>`,
+        `<span style="${{style}}">${{percent(group.usagePct)}}</span>`,
+        `<span style="${{style}}">剩余 ${{money(group.remainingUsd)}}</span>`,
+      ].join("");
+      renderedSlugs.add(slug);
+    }}
+
+    document.querySelectorAll("[data-cch-weekly-quota]").forEach((el) => {{
+      if (!renderedSlugs.has(el.getAttribute("data-cch-weekly-quota"))) el.remove();
+    }});
+    return !missing;
   }};
   const groupSlugFromHref = (href) => {{
     const match = String(href || "").match(/\\/status\\/([^/?#]+)(?:[?#].*)?$/);
@@ -420,9 +450,9 @@ def inject_status_script(html: str, status_group_slug: str, cache_ttl_seconds: i
         `<span style="${{style}}">${{compactNumber(entry.requestCount)}} 次</span>`,
         `<span style="${{style}}">${{tokensM(entry.totalTokens)}}</span>`,
       ];
-      // The configured status group (opus) already shows weekly cost/quota
-      // pills; omit the compact cost tag there.
-      if (slug !== statusGroupSlug) {{
+      // A card with a weekly cap already shows used/quota/remaining. Skip the
+      // extra dollar pill there so the same spend is not shown twice.
+      if (!quotaSlugSet.has(slug)) {{
         pills.push(`<span style="${{style}}">${{money(entry.costUsd)}}</span>`);
       }}
       badges.innerHTML = pills.join("");

@@ -44,31 +44,40 @@ providers:
 #   GET /cch/status
 #   GET /cch/status/weekly-consumption
 #   GET /cch/status/weekly-user-consumption?apiKey=<user-api-key>
-# The weekly number is aggregated from CCH provider limit usage for providers
-# whose provider groups include provider_group.
+# Each quota_groups entry is one weekly USD cap, drawn on its own status card.
+# status_slug is the card (/status/<slug>). provider_group is the CCH provider
+# tag whose weekly spend, request count, and token count are shown on that card.
+# Omit provider_group when it matches status_slug.
+# card_provider_groups is only for a card that has no quota_groups entry and
+# whose name differs from its provider tag.
 # cch_status:
 #   enabled: false
 #   base_url: "http://your-cch-host:22803"
 #   admin_token: "your-cch-auth-token"
 #   locale: "zh-CN"
-#   status_group_slug: "opus"
-#   provider_group: "claude"
 #   timezone: "Asia/Shanghai"
-#   weekly_quota_usd: 500
 #   cache_ttl_seconds: 300
 #   # Enables the cached weekly user usage data used by:
 #   #   /cch/status/weekly-leaderboard
 #   #   /cch/status/weekly-user-consumption?apiKey=<user-api-key>
 #   weekly_leaderboard_enabled: false
-#   # Optional: map public status group slugs to backing provider groups.
-#   # Defaults to slug == provider group when omitted.
-#   status_group_provider_groups:
-#     opus: ["claude"]
-#   auto_manage_provider_group_quota: false
-#   auto_disable_threshold_pct: 100
+#   # Optional. Only for a card with no quota_groups entry whose name differs
+#   # from its provider tag. Quota cards already use provider_group.
+#   # card_provider_groups:
+#   #   sonnet: ["claude"]
+#   quota_groups:
+#     - status_slug: opus
+#       provider_group: claude
+#       weekly_quota_usd: 500
+#       auto_manage: false
+#       disable_at_pct: 100
+#     - status_slug: glm
+#       weekly_quota_usd: 80
+#       auto_manage: true
+#       disable_at_pct: 90
 #   # Real-provider coding-plan usage (Kimi / GLM / MiniMax only).
 #   # Queries 5h + weekly utilization from the vendor API (not CCH), displays
-#   # badges on status groups mapped via status_group_provider_groups, and
+#   # badges on status cards mapped via card_provider_groups, and
 #   # disables/enables CCH providers in provider_group at 100% / reset.
 #   # base_url is optional: defaults are
 #   #   kimi    -> https://api.kimi.com/coding

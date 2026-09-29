@@ -1,7 +1,7 @@
 import hashlib
 import math
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from cch_manage.coding_plan import (
@@ -102,19 +102,34 @@ class UsageQueryConfig:
 
 
 @dataclass(frozen=True)
+class QuotaGroupConfig:
+    """One weekly USD cap shown on a single status-page card.
+
+    status_slug is the card (/status/<slug>). provider_group is the CCH
+    provider tag whose weekly spend is summed and whose providers are
+    disabled when auto_manage is on. The two names match for most cards
+    and differ when the card is not named after the tag (opus vs claude).
+    """
+
+    status_slug: str
+    provider_group: str
+    weekly_quota_usd: Decimal
+    auto_manage: bool = False
+    disable_at_pct: Decimal = Decimal("100")
+
+
+@dataclass(frozen=True)
 class CchStatusConfig:
     base_url: str
     admin_token: str
     locale: str = "zh-CN"
-    status_group_slug: str = "opus"
-    provider_group: str = "claude"
     timezone: str = "Asia/Shanghai"
-    weekly_quota_usd: Decimal | None = None
     cache_ttl_seconds: int = 300
     weekly_leaderboard_enabled: bool = False
-    status_group_provider_groups: dict[str, list[str]] | None = None
-    auto_manage_provider_group_quota: bool = False
-    auto_disable_threshold_pct: Decimal = Decimal("100")
+    # Extra status-card -> provider-tag links for cards that have no quota
+    # group. A quota_groups entry already links its card to its provider tag.
+    card_provider_groups: dict[str, list[str]] | None = None
+    quota_groups: tuple[QuotaGroupConfig, ...] = ()
     usage_monitors: list[UsageMonitorConfig] = field(default_factory=list)
     usage_query: UsageQueryConfig = field(default_factory=UsageQueryConfig)
 
@@ -128,11 +143,9 @@ class CchStatusConfig:
         if not base_url or not admin_token:
             raise ValueError("cch_status.base_url and cch_status.admin_token are required when enabled")
 
-        quota_raw = raw.get("weekly_quota_usd")
-        weekly_quota_usd = Decimal(str(quota_raw)) if quota_raw is not None else None
-        threshold_raw = raw.get("auto_disable_threshold_pct", 100)
-        status_group_provider_groups = parse_status_group_provider_groups(
-            raw.get("status_group_provider_groups")
+        reject_legacy_cch_status_keys(raw)
+        card_provider_groups = parse_status_group_provider_groups(
+            raw.get("card_provider_groups")
         )
         usage_query = UsageQueryConfig.from_dict(
             raw.get("usage_query") if isinstance(raw.get("usage_query"), dict) else None
@@ -143,20 +156,139 @@ class CchStatusConfig:
             base_url=base_url,
             admin_token=admin_token,
             locale=str(raw.get("locale", "zh-CN")).strip("/") or "zh-CN",
-            status_group_slug=str(raw.get("status_group_slug", "opus")),
-            provider_group=str(raw.get("provider_group", "claude")),
             timezone=str(raw.get("timezone", "Asia/Shanghai")),
-            weekly_quota_usd=weekly_quota_usd,
             cache_ttl_seconds=int(raw.get("cache_ttl_seconds", 300)),
             weekly_leaderboard_enabled=bool(raw.get("weekly_leaderboard_enabled", False)),
-            status_group_provider_groups=status_group_provider_groups,
-            auto_manage_provider_group_quota=bool(
-                raw.get("auto_manage_provider_group_quota", False)
-            ),
-            auto_disable_threshold_pct=Decimal(str(threshold_raw)),
+            card_provider_groups=card_provider_groups,
+            quota_groups=parse_quota_groups(raw.get("quota_groups")),
             usage_monitors=usage_monitors,
             usage_query=usage_query,
         )
+
+    def effective_card_provider_groups(self) -> dict[str, list[str]] | None:
+        """Card -> provider tags for price, request, and token badges.
+
+        Each quota group contributes status_slug -> provider_group. An
+        explicit card_provider_groups entry can add further tags for that
+        card, or name the backing tag of a card that has no weekly cap.
+        """
+        merged: dict[str, list[str]] = {
+            slug: list(groups) for slug, groups in (self.card_provider_groups or {}).items()
+        }
+        for group in self.quota_groups:
+            tags = merged.setdefault(group.status_slug, [])
+            if group.provider_group not in tags:
+                tags.append(group.provider_group)
+        return merged or None
+
+
+_LEGACY_CCH_STATUS_KEYS = {
+    "status_group_slug": "quota_groups[].status_slug",
+    "provider_group": "quota_groups[].provider_group",
+    "weekly_quota_usd": "quota_groups[].weekly_quota_usd",
+    "auto_manage_provider_group_quota": "quota_groups[].auto_manage",
+    "auto_disable_threshold_pct": "quota_groups[].disable_at_pct",
+    "status_group_provider_groups": "card_provider_groups",
+}
+
+
+def reject_legacy_cch_status_keys(raw: dict[str, Any]) -> None:
+    found = [key for key in _LEGACY_CCH_STATUS_KEYS if key in raw]
+    if not found:
+        return
+    moved = "\n".join(f"  {key} -> {_LEGACY_CCH_STATUS_KEYS[key]}" for key in found)
+    raise ValueError(
+        "cch_status still has removed settings. Weekly caps belong under "
+        "quota_groups; the status-card to provider-tag map is card_provider_groups.\n"
+        f"{moved}"
+    )
+
+
+def parse_quota_groups(value: Any) -> tuple[QuotaGroupConfig, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("cch_status.quota_groups must be a list")
+
+    groups: list[QuotaGroupConfig] = []
+    seen_slugs: set[str] = set()
+    seen_provider_groups: set[str] = set()
+    for index, item in enumerate(value):
+        path = f"cch_status.quota_groups[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{path} must be a mapping")
+
+        status_slug = _required_name(item.get("status_slug"), f"{path}.status_slug")
+        if status_slug in seen_slugs:
+            raise ValueError(
+                f"{path}: duplicate status_slug {status_slug!r}; "
+                "each status-page card may have at most one weekly cap"
+            )
+        seen_slugs.add(status_slug)
+
+        raw_provider_group = item.get("provider_group")
+        provider_group = (
+            _required_name(raw_provider_group, f"{path}.provider_group")
+            if raw_provider_group is not None
+            else status_slug
+        )
+        if provider_group in seen_provider_groups:
+            raise ValueError(
+                f"{path}: duplicate provider_group {provider_group!r}; "
+                "each provider tag may have at most one weekly cap"
+            )
+        seen_provider_groups.add(provider_group)
+
+        groups.append(
+            QuotaGroupConfig(
+                status_slug=status_slug,
+                provider_group=provider_group,
+                weekly_quota_usd=_parse_positive_decimal(
+                    item.get("weekly_quota_usd"),
+                    f"{path}.weekly_quota_usd",
+                ),
+                auto_manage=bool(item.get("auto_manage", False)),
+                disable_at_pct=_parse_percent(
+                    item.get("disable_at_pct", 100),
+                    f"{path}.disable_at_pct",
+                ),
+            )
+        )
+    return tuple(groups)
+
+
+def _required_name(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{path} is required")
+    return value.strip()
+
+
+def _parse_positive_decimal(value: Any, path: str) -> Decimal:
+    if value is None:
+        raise ValueError(f"{path} is required")
+    number = _parse_decimal(value, path)
+    if number <= 0:
+        raise ValueError(f"{path} must be > 0")
+    return number
+
+
+def _parse_percent(value: Any, path: str) -> Decimal:
+    number = _parse_decimal(value, path)
+    if not Decimal("0") < number <= Decimal("100"):
+        raise ValueError(f"{path} must be in (0, 100]")
+    return number
+
+
+def _parse_decimal(value: Any, path: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise ValueError(f"{path} must be a number")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{path} must be a number") from exc
+    if not number.is_finite():
+        raise ValueError(f"{path} must be a finite number")
+    return number
 
 
 def parse_status_group_provider_groups(value: Any) -> dict[str, list[str]] | None:

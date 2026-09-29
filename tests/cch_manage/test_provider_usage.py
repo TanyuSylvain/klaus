@@ -413,7 +413,7 @@ def test_public_payload_averages_keys_and_marks_stale(tmp_path: Path):
 
 
 def test_inject_status_script_has_usage_key_tooltip():
-    html = inject_status_script("<body></body>", "opus", 300)
+    html = inject_status_script("<body></body>", ["opus"], 300)
     assert "cch-provider-usage-tooltip" in html
     assert "keyUsages" in html
     assert "showUsageTooltip" in html

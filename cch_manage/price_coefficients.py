@@ -67,6 +67,29 @@ def extract_public_group_price_coefficients(
     }
 
 
+def unavailable_status_slugs(
+    providers: list[dict[str, Any]],
+    public_groups: list[dict[str, Any]] | None,
+    status_group_provider_groups: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """Status cards whose backing providers exist and are all disabled."""
+    mapping = status_group_provider_groups or {}
+    unavailable: list[str] = []
+    for public_group in public_groups or []:
+        slug = public_group.get("publicGroupSlug")
+        if not isinstance(slug, str) or not slug:
+            continue
+        backing = set(mapping.get(slug) or [slug])
+        matched = [
+            provider
+            for provider in providers
+            if backing.intersection(provider_groups(provider))
+        ]
+        if matched and all(not provider_enabled(provider) for provider in matched):
+            unavailable.append(slug)
+    return unavailable
+
+
 def coefficient_label(value: Decimal) -> str:
     normalized = value.normalize()
     if normalized == normalized.to_integral():

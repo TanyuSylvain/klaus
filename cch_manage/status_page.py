@@ -299,6 +299,8 @@ def inject_status_script(
   }};
   const coefficientBadgeStyle = () =>
     "border:1px solid rgb(16 185 129 / .55);border-radius:6px;background:rgb(16 185 129 / .12);padding:2px 8px;font-size:12px;line-height:1.25;color:rgb(5 150 105);";
+  const unavailableBadgeStyle = () =>
+    "flex:0 0 auto;margin-left:6px;border:1px solid rgb(239 68 68 / .6);border-radius:6px;background:rgb(239 68 68 / .14);padding:2px 8px;font-size:12px;line-height:1.25;font-weight:600;color:rgb(220 38 38);white-space:nowrap;";
   const usageBadgeColors = {{
     border: "rgb(59 130 246 / .55)",
     background: "rgb(59 130 246 / .12)",
@@ -308,15 +310,34 @@ def inject_status_script(
     const groups = data && data.groups && typeof data.groups === "object" ? data.groups : null;
     if (!groups) return true;
 
+    const unavailable = new Set(
+      Array.isArray(data && data.unavailable) ? data.unavailable.filter((slug) => typeof slug === "string" && slug) : []
+    );
     let renderedAny = false;
+    let missingUnavailable = false;
+    const renderedUnavailable = new Set();
     const links = Array.from(document.querySelectorAll('a[href*="/status/"]'));
     for (const link of links) {{
       const slug = groupSlugFromHref(link.getAttribute("href"));
-      if (!slug || !Array.isArray(groups[slug]) || groups[slug].length === 0) continue;
-      if (!String(link.textContent || "").trim()) continue;
+      if (!slug || !String(link.textContent || "").trim()) continue;
 
       const header = link.closest("div.flex.items-center.gap-2") || link.parentElement;
       if (!header) continue;
+
+      if (unavailable.has(slug)) {{
+        link.style.flex = "0 1 auto";
+        let marker = header.querySelector(`:scope > span[data-cch-unavailable="${{slug}}"]`);
+        if (!marker) {{
+          marker = document.createElement("span");
+          marker.dataset.cchUnavailable = slug;
+          marker.textContent = "Unavailable";
+          marker.style.cssText = unavailableBadgeStyle();
+          link.insertAdjacentElement("afterend", marker);
+        }}
+        renderedUnavailable.add(slug);
+      }}
+
+      if (!Array.isArray(groups[slug]) || groups[slug].length === 0) continue;
       link.style.flex = "0 1 auto";
 
       let badges = header.querySelector(`span[data-cch-price-coefficients="${{slug}}"]`);
@@ -332,7 +353,15 @@ def inject_status_script(
       ).join("");
       renderedAny = true;
     }}
-    return renderedAny || document.querySelector('a[href*="/status/"]') !== null;
+
+    for (const slug of unavailable) {{
+      if (!renderedUnavailable.has(slug)) missingUnavailable = true;
+    }}
+    document.querySelectorAll("[data-cch-unavailable]").forEach((el) => {{
+      if (!unavailable.has(el.getAttribute("data-cch-unavailable"))) el.remove();
+    }});
+    if (missingUnavailable) return false;
+    return renderedAny || unavailable.size > 0 || document.querySelector('a[href*="/status/"]') !== null;
   }};
   let lastProviderUsageData = null;
   // Same mount strategy as weekly consumption (renderQuota): find the group

@@ -27,7 +27,10 @@ from cch_manage.group_usage import (
     collect_provider_usage_stats,
     provider_ids_by_status_slug,
 )
-from cch_manage.price_coefficients import extract_group_price_coefficients
+from cch_manage.price_coefficients import (
+    extract_group_price_coefficients,
+    unavailable_status_slugs,
+)
 from cch_manage.provider_usage import ProviderUsageManager
 from cch_manage.quota import manage_provider_group_quota, quota_usage_summary
 from cch_manage.status_page import inject_status_script, rewrite_root_relative_urls
@@ -429,13 +432,19 @@ class CchStatusFeature:
             if isinstance(raw_groups, list)
             else []
         )
+        card_provider_groups = self.config.effective_card_provider_groups()
         groups = extract_group_price_coefficients(
             providers,
             public_status_groups,
-            self.config.effective_card_provider_groups(),
+            card_provider_groups,
         )
         payload = {
             "groups": groups,
+            "unavailable": unavailable_status_slugs(
+                providers,
+                public_status_groups,
+                card_provider_groups,
+            ),
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }
         self._price_coefficients_cache = payload

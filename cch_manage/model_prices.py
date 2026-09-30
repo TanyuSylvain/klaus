@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from cch_manage.price_coefficients import coefficient_label
@@ -23,6 +23,45 @@ PRICE_RESPONSE_KEYS = (
 )
 _MILLION = Decimal("1000000")
 _DISPLAY_QUANTUM = Decimal("0.000000000001")
+_RATIO_QUANTUM = Decimal("0.0001")
+_OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
+_ANTHROPIC_LONG_CONTEXT_THRESHOLD = 200_000
+_GPT_LONG_CONTEXT_FAMILIES = frozenset({"gpt", "gpt-pro"})
+_LONG_CONTEXT_MARKERS = ("*", "†", "‡", "§", "¶", "‖")
+# Base rate, 272k absolute rate, 200k absolute rate. Priority and flex keys are omitted.
+_LONG_CONTEXT_KINDS = (
+    (
+        "input_cost_per_token",
+        "input_cost_per_token_above_272k_tokens",
+        "input_cost_per_token_above_200k_tokens",
+    ),
+    (
+        "output_cost_per_token",
+        "output_cost_per_token_above_272k_tokens",
+        "output_cost_per_token_above_200k_tokens",
+    ),
+    (
+        "cache_read_input_token_cost",
+        "cache_read_input_token_cost_above_272k_tokens",
+        "cache_read_input_token_cost_above_200k_tokens",
+    ),
+    (
+        "cache_creation_input_token_cost",
+        "cache_creation_input_token_cost_above_272k_tokens",
+        "cache_creation_input_token_cost_above_200k_tokens",
+    ),
+)
+# Base rate, explicit multiplier, explicit absolute rate inside long_context_pricing.
+_EXPLICIT_LONG_CONTEXT_KINDS = (
+    ("input_cost_per_token", "input_multiplier", "input_cost_per_token"),
+    ("output_cost_per_token", "output_multiplier", "output_cost_per_token"),
+    ("cache_read_input_token_cost", "cache_read_input_multiplier", "cache_read_input_token_cost"),
+    (
+        "cache_creation_input_token_cost",
+        "cache_creation_input_multiplier",
+        "cache_creation_input_token_cost",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +74,8 @@ class StoredModelPrice:
     cache_write_per_m: Decimal | None
     per_call: Decimal | None
     updated_at: datetime
+    long_context_threshold: int | None = None
+    long_context_coefficient: Decimal | None = None
 
     def amounts(self) -> dict[str, Decimal | None]:
         return {
@@ -108,6 +149,7 @@ def stored_price_from_data(
             updated_at=updated_at,
         )
     if input_token is not None or output_token is not None:
+        tier = _long_context_tier(price_data)
         return StoredModelPrice(
             model_name=model_name,
             billing="token",
@@ -119,6 +161,8 @@ def stored_price_from_data(
             ),
             per_call=None,
             updated_at=updated_at,
+            long_context_threshold=None if tier is None else tier[0],
+            long_context_coefficient=None if tier is None else tier[1],
         )
     return _empty_row(model_name, "unknown", updated_at)
 
@@ -183,12 +227,21 @@ def build_model_price_response(
     generated_at: str,
 ) -> dict[str, Any]:
     if not stored_rows:
-        return {"generatedAt": generated_at, "syncedAt": None, "models": []}
+        return {
+            "generatedAt": generated_at,
+            "syncedAt": None,
+            "models": [],
+            "longContextNotes": [],
+        }
 
     by_name = {row.model_name: row for row in stored_rows}
     synced_at = max(row.updated_at for row in stored_rows)
+    public_models = collect_public_models(public_groups)
+    markers = _long_context_markers(
+        [by_name.get(model_name) for model_name, _slugs in public_models]
+    )
     models: list[dict[str, Any]] = []
-    for model_name, slugs in collect_public_models(public_groups):
+    for model_name, slugs in public_models:
         row = by_name.get(model_name)
         coefficients = coefficients_for_model(
             model_name,
@@ -204,12 +257,14 @@ def build_model_price_response(
                 "prices": _price_strings(row),
                 "adjusted": _adjusted_strings(row, coefficients),
                 "coefficients": [coefficient_label(value) for value in coefficients],
+                "longContext": _long_context_model(row, markers),
             }
         )
     return {
         "generatedAt": generated_at,
         "syncedAt": synced_at.isoformat(),
         "models": models,
+        "longContextNotes": _long_context_notes(markers),
     }
 
 
@@ -261,6 +316,159 @@ async def sync_model_prices(
 ) -> None:
     rows = await collect_model_price_rows(client, public_groups, updated_at=updated_at)
     await store.replace_all(rows)
+
+
+def _long_context_tier(price_data: dict[str, Any]) -> tuple[int, Decimal] | None:
+    """Highest ratio above 1 across input, output, cache read, and cache write.
+
+    Once input context crosses the threshold, CCH bills the whole request at the
+    higher unit rates. A ratio of 1 is the same list price. Priority, flex, and
+    nested vendor copies are not the top-level rates CCH bills.
+    """
+    explicit = _tier_from_long_context_pricing(price_data)
+    if explicit is not None:
+        return explicit
+    return _tier_from_above_fields(price_data)
+
+
+def _tier_from_long_context_pricing(price_data: dict[str, Any]) -> tuple[int, Decimal] | None:
+    pricing = price_data.get("long_context_pricing")
+    if not isinstance(pricing, dict):
+        return None
+    threshold = _threshold_tokens(pricing.get("threshold_tokens"))
+    if threshold is None:
+        return None
+    ratios: list[Decimal] = []
+    for base_key, multiplier_key, cost_key in _EXPLICIT_LONG_CONTEXT_KINDS:
+        base = _optional_decimal(price_data, base_key)
+        if base is None or base <= 0:
+            continue
+        explicit_cost = _optional_decimal(pricing, cost_key)
+        if explicit_cost is not None:
+            ratio = explicit_cost / base
+        else:
+            multiplier = _optional_decimal(pricing, multiplier_key)
+            if multiplier is None:
+                continue
+            ratio = multiplier
+        normalized = _normalize_ratio(ratio)
+        if normalized > 1:
+            ratios.append(normalized)
+    if not ratios:
+        return None
+    return threshold, max(ratios)
+
+
+def _tier_from_above_fields(price_data: dict[str, Any]) -> tuple[int, Decimal] | None:
+    ratios: list[Decimal] = []
+    saw_272k = False
+    saw_200k = False
+    for base_key, above_272_key, above_200_key in _LONG_CONTEXT_KINDS:
+        premium_272 = _optional_decimal(price_data, above_272_key)
+        premium_200 = _optional_decimal(price_data, above_200_key)
+        if premium_272 is not None:
+            saw_272k = True
+            premium = premium_272
+        elif premium_200 is not None:
+            saw_200k = True
+            premium = premium_200
+        else:
+            continue
+        base = _optional_decimal(price_data, base_key)
+        if base is None or base <= 0:
+            continue
+        normalized = _normalize_ratio(premium / base)
+        if normalized > 1:
+            ratios.append(normalized)
+    if not ratios:
+        return None
+    family = price_data.get("model_family")
+    if saw_272k or (isinstance(family, str) and family in _GPT_LONG_CONTEXT_FAMILIES):
+        return _OPENAI_LONG_CONTEXT_THRESHOLD, max(ratios)
+    if saw_200k:
+        return _ANTHROPIC_LONG_CONTEXT_THRESHOLD, max(ratios)
+    return None
+
+
+def _threshold_tokens(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite() or number <= 0:
+        return None
+    return int(number.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def _normalize_ratio(ratio: Decimal) -> Decimal:
+    rounded = ratio.quantize(_RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+    nearest = rounded.to_integral_value(rounding=ROUND_HALF_UP)
+    if abs(rounded - nearest) <= _RATIO_QUANTUM:
+        return nearest
+    return rounded
+
+
+def _long_context_markers(
+    rows: list[StoredModelPrice | None],
+) -> dict[tuple[int, Decimal], str]:
+    classes = {
+        key
+        for key in (_long_context_key(row) for row in rows)
+        if key is not None
+    }
+    ordered = sorted(classes)
+    return {key: _long_context_marker(index) for index, key in enumerate(ordered)}
+
+
+def _long_context_key(row: StoredModelPrice | None) -> tuple[int, Decimal] | None:
+    if row is None or row.long_context_threshold is None or row.long_context_coefficient is None:
+        return None
+    return row.long_context_threshold, row.long_context_coefficient
+
+
+def _long_context_marker(index: int) -> str:
+    if index < len(_LONG_CONTEXT_MARKERS):
+        return _LONG_CONTEXT_MARKERS[index]
+    return f"*{index + 1}"
+
+
+def _long_context_model(
+    row: StoredModelPrice | None,
+    markers: dict[tuple[int, Decimal], str],
+) -> dict[str, Any] | None:
+    key = _long_context_key(row)
+    if key is None:
+        return None
+    return {
+        "marker": markers[key],
+        "threshold": key[0],
+        "coefficient": decimal_string(key[1]),
+    }
+
+
+def _long_context_notes(markers: dict[tuple[int, Decimal], str]) -> list[dict[str, str]]:
+    return [
+        {"marker": marker, "text": _long_context_footnote(threshold, coefficient)}
+        for (threshold, coefficient), marker in markers.items()
+    ]
+
+
+def _long_context_footnote(threshold: int, coefficient: Decimal) -> str:
+    return (
+        "当单次请求的输入上下文超过"
+        f"{_format_context_threshold(threshold)}时，整次请求改按"
+        f"{decimal_string(coefficient)}倍单价计费。"
+    )
+
+
+def _format_context_threshold(threshold: int) -> str:
+    if threshold > 0 and threshold % 1_000_000 == 0:
+        return f"{threshold // 1_000_000}M"
+    if threshold > 0 and threshold % 1_000 == 0:
+        return f"{decimal_string(Decimal(threshold) / Decimal(1000))}K"
+    return str(threshold)
 
 
 def _empty_row(model_name: str, billing: str, updated_at: datetime) -> StoredModelPrice:

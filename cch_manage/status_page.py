@@ -121,7 +121,11 @@ def model_price_client_script() -> str:
           const groups = Array.isArray(model.groups)
             ? model.groups.map((slug) => escapeHtml(slug)).join(" · ")
             : "";
-          return `<td style="padding:10px 12px;vertical-align:top"><div style="font-weight:600">${escapeHtml(model.model)}</div><div style="color:var(--muted-foreground);font-size:0.75rem">${groups}</div></td>`;
+          const longContext = model.longContext;
+          const marker = longContext && longContext.marker
+            ? `<sup style="font-weight:600;margin-left:1px">${escapeHtml(longContext.marker)}</sup>`
+            : "";
+          return `<td style="padding:10px 12px;vertical-align:top"><div style="font-weight:600">${escapeHtml(model.model)}${marker}</div><div style="color:var(--muted-foreground);font-size:0.75rem">${groups}</div></td>`;
         }
         const source = showPriceCoeff ? model.adjusted : model.prices;
         const cell = source ? source[column.key] : null;
@@ -129,7 +133,16 @@ def model_price_client_script() -> str:
       }).join("");
       return `<tr>${cells}</tr>`;
     }).join("");
-    body.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:0.875rem;line-height:1.4;color:var(--foreground)"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+    const notes = Array.isArray(pricePayload.longContextNotes) ? pricePayload.longContextNotes : [];
+    const footnotes = notes.map((note) => {
+      const marker = note && note.marker ? escapeHtml(note.marker) : "";
+      const text = note && note.text ? escapeHtml(note.text) : "";
+      return `<div>${marker} ${text}</div>`;
+    }).join("");
+    const footnoteBlock = footnotes
+      ? `<div style="margin:10px 12px 4px;color:var(--muted-foreground);font-size:0.75rem;line-height:1.5">${footnotes}</div>`
+      : "";
+    body.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:0.875rem;line-height:1.4;color:var(--foreground)"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>${footnoteBlock}`;
     body.querySelectorAll("[data-price-sort]").forEach((button) => {
       button.addEventListener("click", () => {
         const key = button.getAttribute("data-price-sort") || "";

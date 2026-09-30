@@ -16,9 +16,18 @@ CREATE TABLE IF NOT EXISTS cch_model_prices (
     cache_read_per_m numeric,
     cache_write_per_m numeric,
     per_call numeric,
-    updated_at timestamptz NOT NULL
+    updated_at timestamptz NOT NULL,
+    long_context_threshold integer,
+    long_context_coefficient numeric
 )
 """
+
+_LONG_CONTEXT_COLUMN_SQL = (
+    "ALTER TABLE cch_model_prices "
+    "ADD COLUMN IF NOT EXISTS long_context_threshold integer",
+    "ALTER TABLE cch_model_prices "
+    "ADD COLUMN IF NOT EXISTS long_context_coefficient numeric",
+)
 
 _UPSERT_SQL = """
 INSERT INTO cch_model_prices (
@@ -29,8 +38,10 @@ INSERT INTO cch_model_prices (
     cache_read_per_m,
     cache_write_per_m,
     per_call,
-    updated_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    updated_at,
+    long_context_threshold,
+    long_context_coefficient
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (model_name) DO UPDATE SET
     billing = EXCLUDED.billing,
     input_per_m = EXCLUDED.input_per_m,
@@ -38,7 +49,9 @@ ON CONFLICT (model_name) DO UPDATE SET
     cache_read_per_m = EXCLUDED.cache_read_per_m,
     cache_write_per_m = EXCLUDED.cache_write_per_m,
     per_call = EXCLUDED.per_call,
-    updated_at = EXCLUDED.updated_at
+    updated_at = EXCLUDED.updated_at,
+    long_context_threshold = EXCLUDED.long_context_threshold,
+    long_context_coefficient = EXCLUDED.long_context_coefficient
 """
 
 
@@ -56,7 +69,10 @@ class PostgresModelPriceStore:
             self._pool = None
 
     async def ensure_schema(self) -> None:
-        await self._require_pool().execute(_SCHEMA_SQL)
+        pool = self._require_pool()
+        await pool.execute(_SCHEMA_SQL)
+        for statement in _LONG_CONTEXT_COLUMN_SQL:
+            await pool.execute(statement)
 
     async def replace_all(self, rows: list[StoredModelPrice]) -> None:
         pool = self._require_pool()
@@ -87,7 +103,9 @@ class PostgresModelPriceStore:
                 cache_read_per_m,
                 cache_write_per_m,
                 per_call,
-                updated_at
+                updated_at,
+                long_context_threshold,
+                long_context_coefficient
             FROM cch_model_prices
             """
         )
@@ -109,6 +127,8 @@ class PostgresModelPriceStore:
             row.cache_write_per_m,
             row.per_call,
             row.updated_at,
+            row.long_context_threshold,
+            row.long_context_coefficient,
         )
 
     @staticmethod
@@ -122,7 +142,17 @@ class PostgresModelPriceStore:
             cache_write_per_m=_decimal_or_none(record["cache_write_per_m"]),
             per_call=_decimal_or_none(record["per_call"]),
             updated_at=_datetime(record["updated_at"]),
+            long_context_threshold=_int_or_none(record["long_context_threshold"]),
+            long_context_coefficient=_decimal_or_none(record["long_context_coefficient"]),
         )
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return int(value)
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

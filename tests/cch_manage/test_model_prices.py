@@ -6,6 +6,7 @@ import pytest
 
 from cch_manage.config import CchStatusConfig
 from cch_manage.feature import CchStatusFeature
+from cch_manage.model_price_store import PostgresModelPriceStore
 from cch_manage.model_prices import (
     StoredModelPrice,
     build_model_price_response,
@@ -371,3 +372,363 @@ def test_status_script_includes_the_price_table_control():
     assert "background:#2563eb" in html
     assert "background:#e5e7eb" in html
     assert html.rfind("paintPriceSwitch()") > html.find("shell.appendChild(panel)")
+
+
+def _astra_price() -> dict:
+    return {
+        "mode": "chat",
+        "model_family": "gpt-sol",
+        "input_cost_per_token": "0.00001",
+        "output_cost_per_token": "0.00005",
+        "cache_creation_input_token_cost": "0.0000125",
+        "cache_read_input_token_cost": "0.000001",
+        "input_cost_per_token_above_272k_tokens": "0.00001",
+        "output_cost_per_token_above_272k_tokens": "0.000075",
+        "cache_creation_input_token_cost_above_272k_tokens": "0.000025",
+        "cache_read_input_token_cost_above_272k_tokens": "0.000002",
+    }
+
+
+def test_long_context_tier_keeps_the_highest_ratio_above_one():
+    row = stored_price_from_data("gpt-6-astra", _astra_price(), updated_at=NOW)
+
+    assert row.billing == "token"
+    assert row.long_context_threshold == 272_000
+    assert row.long_context_coefficient == Decimal("2")
+    assert decimal_string(row.input_per_m) == "10"
+    assert decimal_string(row.output_per_m) == "50"
+
+
+def test_long_context_tier_skips_a_cache_kind_without_its_own_above_rate():
+    row = stored_price_from_data(
+        "gpt-6-luna",
+        {
+            "mode": "chat",
+            "model_family": "gpt-luna",
+            "input_cost_per_token": "0.0000001",
+            "output_cost_per_token": "0.0000005",
+            "cache_creation_input_token_cost": "0.000000125",
+            "cache_read_input_token_cost": "0.00000001",
+            "input_cost_per_token_above_272k_tokens": "0.000002",
+            "output_cost_per_token_above_272k_tokens": "0.000009",
+            "cache_read_input_token_cost_above_272k_tokens": "0.0000002",
+            "input_cost_per_token_above_272k_tokens_priority": "0.000004",
+            "output_cost_per_token_above_272k_tokens_priority": "0.000018",
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold == 272_000
+    assert row.long_context_coefficient == Decimal("20")
+
+
+def test_long_context_ratio_snaps_float_dust_to_an_integer():
+    row = stored_price_from_data(
+        "gpt-6-sol",
+        {
+            "mode": "chat",
+            "input_cost_per_token": "0.000002",
+            "output_cost_per_token": "0.00001",
+            "cache_read_input_token_cost": "0.0000002",
+            "cache_read_input_token_cost_above_272k_tokens": "0.00000199998",
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold == 272_000
+    assert row.long_context_coefficient == Decimal("10")
+
+
+def test_long_context_threshold_is_200k_when_only_200k_fields_exist():
+    row = stored_price_from_data(
+        "claude-sonnet",
+        {
+            "mode": "chat",
+            "model_family": "claude",
+            "input_cost_per_token": "0.000003",
+            "output_cost_per_token": "0.000015",
+            "input_cost_per_token_above_200k_tokens": "0.000006",
+            "output_cost_per_token_above_200k_tokens": "0.0000225",
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold == 200_000
+    assert row.long_context_coefficient == Decimal("2")
+
+
+def test_gpt_family_with_only_200k_fields_uses_the_272k_threshold():
+    row = stored_price_from_data(
+        "gpt-5",
+        {
+            "mode": "chat",
+            "model_family": "gpt",
+            "input_cost_per_token": "0.000002",
+            "output_cost_per_token": "0.000008",
+            "input_cost_per_token_above_200k_tokens": "0.000004",
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold == 272_000
+    assert row.long_context_coefficient == Decimal("2")
+
+
+def test_flat_long_context_ratio_is_not_a_tier():
+    row = stored_price_from_data(
+        "flat",
+        {
+            "mode": "chat",
+            "input_cost_per_token": "0.00001",
+            "output_cost_per_token": "0.00005",
+            "input_cost_per_token_above_272k_tokens": "0.00001",
+            "output_cost_per_token_above_272k_tokens": "0.00005",
+            "cache_creation_input_token_cost_above_272k_tokens": "0.00002",
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold is None
+    assert row.long_context_coefficient is None
+
+
+def test_priority_flex_nested_and_one_hour_cache_are_not_a_tier():
+    row = stored_price_from_data(
+        "gpt-6-luna",
+        {
+            "mode": "chat",
+            "model_family": "gpt",
+            "input_cost_per_token": "0.0000001",
+            "output_cost_per_token": "0.0000005",
+            "input_cost_per_token_above_272k_tokens_priority": "0.000002",
+            "output_cost_per_token_above_272k_tokens_priority": "0.000009",
+            "input_cost_per_token_above_272k_tokens_flex": "0.00000005",
+            "cache_creation_input_token_cost_above_1hr_above_272k_tokens": "0.00001",
+            "pricing": {
+                "openai": {"input_cost_per_token_above_272k_tokens": "0.000002"},
+            },
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold is None
+    assert row.long_context_coefficient is None
+
+
+def test_explicit_long_context_pricing_wins_when_its_ratio_exceeds_one():
+    row = stored_price_from_data(
+        "explicit",
+        {
+            "mode": "chat",
+            "input_cost_per_token": "0.000002",
+            "output_cost_per_token": "0.00001",
+            "input_cost_per_token_above_272k_tokens": "0.00002",
+            "long_context_pricing": {
+                "threshold_tokens": 128_000,
+                "input_multiplier": 3,
+                "output_cost_per_token": "0.000015",
+            },
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold == 128_000
+    assert row.long_context_coefficient == Decimal("3")
+
+
+def test_explicit_long_context_pricing_at_one_falls_through_to_above_fields():
+    row = stored_price_from_data(
+        "fallback",
+        {
+            "mode": "chat",
+            "model_family": "claude",
+            "input_cost_per_token": "0.000002",
+            "output_cost_per_token": "0.00001",
+            "input_cost_per_token_above_200k_tokens": "0.000004",
+            "long_context_pricing": {
+                "threshold_tokens": 100_000,
+                "input_multiplier": 1,
+                "output_multiplier": "1",
+            },
+        },
+        updated_at=NOW,
+    )
+
+    assert row.long_context_threshold == 200_000
+    assert row.long_context_coefficient == Decimal("2")
+
+
+def test_call_priced_model_and_a_missing_record_have_no_long_context_tier():
+    image = stored_price_from_data(
+        "gpt-image-2",
+        {
+            "mode": "image_generation",
+            "input_cost_per_request": 1,
+            "input_cost_per_token": "0.000001",
+            "output_cost_per_token": "0.000002",
+            "input_cost_per_token_above_272k_tokens": "0.00001",
+        },
+        updated_at=NOW,
+    )
+    missing = stored_price_from_data("k3", None, updated_at=NOW)
+
+    assert image.long_context_threshold is None
+    assert image.long_context_coefficient is None
+    assert missing.long_context_threshold is None
+    assert missing.long_context_coefficient is None
+
+
+def test_response_groups_long_context_classes_and_writes_the_footnote():
+    def price(above_key: str, above: str, *, family: str) -> dict:
+        return {
+            "mode": "chat",
+            "model_family": family,
+            "input_cost_per_token": "0.000001",
+            "output_cost_per_token": "0.000002",
+            above_key: above,
+        }
+
+    groups = [
+        {
+            "publicGroupSlug": "prem",
+            "models": [
+                {"publicModelKey": "wide-200"},
+                {"publicModelKey": "wide-272-low"},
+                {"publicModelKey": "wide-272-low-again"},
+                {"publicModelKey": "wide-272-high"},
+                {"publicModelKey": "plain"},
+            ],
+        }
+    ]
+    stored = [
+        stored_price_from_data(
+            "wide-200",
+            price("input_cost_per_token_above_200k_tokens", "0.000002", family="claude"),
+            updated_at=NOW,
+        ),
+        stored_price_from_data(
+            "wide-272-low",
+            price("input_cost_per_token_above_272k_tokens", "0.000002", family="gpt-sol"),
+            updated_at=NOW,
+        ),
+        stored_price_from_data(
+            "wide-272-low-again",
+            price("input_cost_per_token_above_272k_tokens", "0.000002", family="gpt-sol"),
+            updated_at=NOW,
+        ),
+        stored_price_from_data(
+            "wide-272-high",
+            price("input_cost_per_token_above_272k_tokens", "0.00001", family="gpt-sol"),
+            updated_at=NOW,
+        ),
+        stored_price_from_data("plain", _token_price(), updated_at=NOW),
+    ]
+
+    payload = build_model_price_response(
+        groups,
+        stored,
+        [],
+        None,
+        generated_at="2026-09-29T16:00:00+08:00",
+    )
+
+    by_name = {model["model"]: model for model in payload["models"]}
+    assert by_name["wide-200"]["longContext"] == {
+        "marker": "*",
+        "threshold": 200_000,
+        "coefficient": "2",
+    }
+    assert by_name["wide-272-low"]["longContext"]["marker"] == "†"
+    assert by_name["wide-272-low-again"]["longContext"]["marker"] == "†"
+    assert by_name["wide-272-high"]["longContext"] == {
+        "marker": "‡",
+        "threshold": 272_000,
+        "coefficient": "10",
+    }
+    assert by_name["plain"]["longContext"] is None
+    assert by_name["wide-272-low"]["prices"]["inputPerM"] == "1"
+    assert payload["longContextNotes"] == [
+        {
+            "marker": "*",
+            "text": "当单次请求的输入上下文超过200K时，整次请求改按2倍单价计费。",
+        },
+        {
+            "marker": "†",
+            "text": "当单次请求的输入上下文超过272K时，整次请求改按2倍单价计费。",
+        },
+        {
+            "marker": "‡",
+            "text": "当单次请求的输入上下文超过272K时，整次请求改按10倍单价计费。",
+        },
+    ]
+
+
+def test_seventh_long_context_class_uses_a_numbered_marker():
+    groups = [
+        {
+            "publicGroupSlug": "prem",
+            "models": [{"publicModelKey": f"m{index}"} for index in range(7)],
+        }
+    ]
+    stored = [
+        stored_price_from_data(
+            f"m{index}",
+            {
+                "mode": "chat",
+                "model_family": "claude",
+                "input_cost_per_token": "0.000001",
+                "output_cost_per_token": "0.000002",
+                "input_cost_per_token_above_200k_tokens": str(Decimal("0.000001") * (index + 2)),
+            },
+            updated_at=NOW,
+        )
+        for index in range(7)
+    ]
+
+    payload = build_model_price_response(groups, stored, [], None, generated_at="2026-09-29T16:00:00+08:00")
+
+    assert [model["longContext"]["marker"] for model in payload["models"]] == [
+        "*",
+        "†",
+        "‡",
+        "§",
+        "¶",
+        "‖",
+        "*7",
+    ]
+    assert payload["longContextNotes"][-1]["text"] == (
+        "当单次请求的输入上下文超过200K时，整次请求改按8倍单价计费。"
+    )
+
+
+def test_price_store_maps_long_context_columns():
+    row = stored_price_from_data("gpt-6-astra", _astra_price(), updated_at=NOW)
+
+    args = PostgresModelPriceStore._row_args(row)
+    assert args[-2:] == (272_000, Decimal("2"))
+
+    record = {
+        "model_name": "gpt-6-astra",
+        "billing": "token",
+        "input_per_m": Decimal("10"),
+        "output_per_m": Decimal("50"),
+        "cache_read_per_m": Decimal("1"),
+        "cache_write_per_m": Decimal("12.5"),
+        "per_call": None,
+        "updated_at": NOW,
+        "long_context_threshold": 272_000,
+        "long_context_coefficient": Decimal("2"),
+    }
+    loaded = PostgresModelPriceStore._row_from_record(record)
+
+    assert loaded.long_context_threshold == 272_000
+    assert loaded.long_context_coefficient == Decimal("2")
+    assert loaded.input_per_m == Decimal("10")
+
+
+def test_status_script_renders_long_context_markers_and_footnotes():
+    html = inject_status_script("<body></body>", ["lux"], 300)
+
+    assert "model.longContext" in html
+    assert "pricePayload.longContextNotes" in html
+    assert "<sup" in html

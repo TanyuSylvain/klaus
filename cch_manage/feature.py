@@ -572,6 +572,7 @@ class CchStatusFeature:
                 "generatedAt": generated_at,
                 "syncedAt": None,
                 "models": [],
+                "longContextNotes": [],
             }
         else:
             providers = await self._require_cch().list_providers()

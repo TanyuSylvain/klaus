@@ -178,6 +178,9 @@ class CchStatusConfig:
     usage_query: UsageQueryConfig = field(default_factory=UsageQueryConfig)
     model_prices: ModelPriceConfig | None = None
     rankings: RankingsConfig | None = None
+    # CCH user tags allowed on the weekly leaderboard and the rank table.
+    # Empty means every user. A user matches when they have any listed tag.
+    user_tags: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "CchStatusConfig | None":
@@ -213,6 +216,7 @@ class CchStatusConfig:
             usage_query=usage_query,
             model_prices=model_prices,
             rankings=rankings,
+            user_tags=parse_user_tags(raw.get("user_tags")),
         )
 
     def effective_card_provider_groups(self) -> dict[str, list[str]] | None:
@@ -252,6 +256,25 @@ def reject_legacy_cch_status_keys(raw: dict[str, Any]) -> None:
         "quota_groups; the status-card to provider-tag map is card_provider_groups.\n"
         f"{moved}"
     )
+
+
+def parse_user_tags(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("cch_status.user_tags must be a list")
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"cch_status.user_tags[{index}] must be a non-empty string")
+        tag = item.strip()
+        if tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+    return tuple(tags)
 
 
 def parse_quota_groups(value: Any) -> tuple[QuotaGroupConfig, ...]:

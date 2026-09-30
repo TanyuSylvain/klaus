@@ -8,6 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
+from cch_manage.user_tags import user_matches_tags
 from cch_manage.utils import decimal_from_any, int_from_any, money_float
 
 
@@ -108,12 +109,15 @@ def build_rank_response(
 def _rank_jobs(
     users: list[dict[str, Any]],
     models: list[str],
+    user_tags: tuple[str, ...] = (),
 ) -> list[tuple[str, str, str, int | None, str | None]]:
     jobs: list[tuple[str, str, str, int | None, str | None]] = []
     seen_users: set[int] = set()
     for user in users:
         user_id = user.get("id")
         if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            continue
+        if not user_matches_tags(user, user_tags):
             continue
         if user_id in seen_users:
             continue
@@ -136,11 +140,12 @@ async def collect_rank_rows(
     *,
     week_start: datetime,
     query_end: datetime,
+    user_tags: tuple[str, ...] = (),
 ) -> list[StoredRankRow]:
     users, models = await asyncio.gather(client.list_users(), client.list_usage_models())
     start_ms = int(week_start.timestamp() * 1000)
     end_ms = int(query_end.timestamp() * 1000)
-    jobs = _rank_jobs(users, models)
+    jobs = _rank_jobs(users, models, user_tags)
     semaphore = asyncio.Semaphore(RANK_FETCH_CONCURRENCY)
     rows: list[StoredRankRow] = []
     errors: list[BaseException] = []
@@ -196,8 +201,14 @@ async def sync_rankings(
     week_end: datetime,
     query_end: datetime,
     updated_at: datetime,
+    user_tags: tuple[str, ...] = (),
 ) -> int:
-    rows = await collect_rank_rows(client, week_start=week_start, query_end=query_end)
+    rows = await collect_rank_rows(
+        client,
+        week_start=week_start,
+        query_end=query_end,
+        user_tags=user_tags,
+    )
     await store.replace_all(
         rows,
         week_start=week_start,

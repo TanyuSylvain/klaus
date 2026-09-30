@@ -47,14 +47,23 @@ class _Store:
 
 
 class _Client:
-    def __init__(self, stats: dict[tuple[str, str], dict[str, Any]], *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        stats: dict[tuple[str, str], dict[str, Any]],
+        *,
+        fail: bool = False,
+        users: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.stats = stats
         self.fail = fail
         self.calls: list[dict[str, Any]] = []
         self.list_calls = 0
+        self.users = users
 
     async def list_users(self) -> list[dict[str, Any]]:
         self.list_calls += 1
+        if self.users is not None:
+            return self.users
         return [
             {"id": 1, "name": "ada"},
             {"id": 2, "name": " ada "},
@@ -118,6 +127,39 @@ def test_sync_rankings_maps_totals_drops_zeros_and_keeps_duplicate_names():
     assert ("model", "glm-5.3") not in {(row.scope, row.entity_key) for row in store.rows}
 
 
+def test_sync_rankings_keeps_users_with_a_configured_tag():
+    client = _Client(
+        _stats(),
+        users=[
+            {"id": 1, "name": "ada", "tags": ["internal"]},
+            {"id": 2, "name": "beau", "tags": ["external"]},
+            {"id": 3, "name": "cy", "tags": [" vip ", "internal"]},
+            {"id": 4, "name": "dee"},
+        ],
+    )
+    store = _Store()
+
+    count = asyncio.run(
+        sync_rankings(
+            client,
+            store,
+            week_start=WEEK_START,
+            week_end=WEEK_END,
+            query_end=QUERY_END,
+            updated_at=UPDATED_AT,
+            user_tags=("internal",),
+        )
+    )
+
+    assert count == 3
+    assert [(row.scope, row.entity_key) for row in store.rows] == [
+        ("user", "1"),
+        ("model", "k3"),
+        ("user", "3"),
+    ]
+    assert {call.get("user_id") for call in client.calls} == {1, 3, None}
+
+
 def test_failed_rank_collection_does_not_replace_the_snapshot():
     client = _Client(_stats(), fail=True)
     store = _Store()
@@ -173,6 +215,28 @@ def test_rankings_config_parses_defaults_and_rejects_a_short_interval():
     assert cfg.rankings is not None
     assert cfg.rankings.database_url == "postgresql://llm_proxy@127.0.0.1:5432/llm_proxy"
     assert cfg.rankings.update_interval_seconds == 21600
+    assert cfg.user_tags == ()
+
+    tagged = CchStatusConfig.from_dict(
+        {
+            "enabled": True,
+            "base_url": "http://cch.local",
+            "admin_token": "token",
+            "user_tags": [" internal ", "internal", "vip"],
+        }
+    )
+    assert tagged is not None
+    assert tagged.user_tags == ("internal", "vip")
+
+    with pytest.raises(ValueError, match="user_tags"):
+        CchStatusConfig.from_dict(
+            {
+                "enabled": True,
+                "base_url": "http://cch.local",
+                "admin_token": "token",
+                "user_tags": "internal",
+            }
+        )
 
     omitted = CchStatusConfig.from_dict(
         {"enabled": True, "base_url": "http://cch.local", "admin_token": "token"}

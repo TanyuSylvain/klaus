@@ -150,6 +150,27 @@ def extract_api_key_hashes(api_keys: list[str]) -> list[str]:
     return sorted(key_hashes)
 
 
+def restrict_leaderboard(
+    entries: list[dict[str, Any]],
+    allowed_user_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Copy the spend order, keep allowed users, and number that subset from 1."""
+    visible = [
+        dict(entry)
+        for entry in entries
+        if _leaderboard_user_id(entry.get("userId")) in allowed_user_ids
+    ]
+    for index, entry in enumerate(visible):
+        entry["rank"] = index + 1
+    return visible
+
+
+def _leaderboard_user_id(user_id: Any) -> int | None:
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+        return None
+    return user_id
+
+
 def public_leaderboard_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value

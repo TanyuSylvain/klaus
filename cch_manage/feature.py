@@ -19,9 +19,11 @@ from cch_manage.leaderboard import (
     api_key_hash,
     get_weekly_leaderboard as build_weekly_leaderboard,
     public_leaderboard_entry,
+    restrict_leaderboard,
     weekly_total_requests,
     weekly_total_used_usd,
 )
+from cch_manage.user_tags import allowed_user_ids
 from cch_manage.group_usage import (
     build_group_usage_payload,
     collect_provider_usage_stats,
@@ -446,16 +448,26 @@ class CchStatusFeature:
                 ZoneInfo(self.config.timezone),
             )
 
+        # The public board and its totals follow user_tags. userUsage stays
+        # complete so a user's own weekly-usage lookup still resolves.
+        displayed = leaderboard
+        if self.config.user_tags:
+            directory = await self._require_cch().list_users()
+            displayed = restrict_leaderboard(
+                leaderboard,
+                allowed_user_ids(directory, self.config.user_tags),
+            )
+
         payload = {
             "weekStart": week_start.isoformat(),
             "weekEnd": week_end.isoformat(),
             "weeklyLeaderboardEnabled": self.config.weekly_leaderboard_enabled,
             "leaderboard": [
                 public_leaderboard_entry(entry)
-                for entry in active_leaderboard_entries(leaderboard)[:3]
+                for entry in active_leaderboard_entries(displayed)[:3]
             ],
-            "weeklyTotalRequests": weekly_total_requests(leaderboard),
-            "weeklyTotalUsedUsd": weekly_total_used_usd(leaderboard),
+            "weeklyTotalRequests": weekly_total_requests(displayed),
+            "weeklyTotalUsedUsd": weekly_total_used_usd(displayed),
             "userUsage": leaderboard,
             "generatedAt": datetime.now(ZoneInfo(self.config.timezone)).isoformat(),
         }
@@ -878,6 +890,7 @@ class CchStatusFeature:
             week_end=week_end,
             query_end=now,
             updated_at=now,
+            user_tags=self.config.user_tags,
         )
         self._rankings_cache = None
         self._rankings_cache_expires_at = 0.0

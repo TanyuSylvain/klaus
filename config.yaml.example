@@ -76,6 +76,11 @@ providers:
 #   #   /cch/status/weekly-leaderboard
 #   #   /cch/status/weekly-user-consumption?apiKey=<user-api-key>
 #   weekly_leaderboard_enabled: false
+#   # CCH user tags shown on the weekly leaderboard and the 排行榜 user table.
+#   # A user is included when they have at least one of these tags. Omit the
+#   # list, or leave it empty, to show every user. Model rows are not filtered.
+#   user_tags:
+#     - internal
 #   # Optional. Only for a card with no quota_groups entry whose name differs
 #   # from its provider tag. Quota cards already use provider_group.
 #   # card_provider_groups:
